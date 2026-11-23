@@ -1261,6 +1261,420 @@ fn atleast_3d(a: &NdArray) -> PyResult<NdArray> {
     }
 }
 
+// ========== Python 层热点下放（第四轮） ==========
+
+/// einsum 通用路径求值器（f64 双通道中的实数通道）：
+/// 全部 label 维做笛卡尔积（ odometer：末 label 最快，与 Python itertools.product 加和顺序一致），
+/// 逐项连乘后累加到输出网格（输出 label C 序，首输出 label 最慢）。
+/// data: 各输入 flat C 序数据；shapes: 各输入形状；terms: 各 term 的 label id 序列；
+/// out_labels: 输出 label id；label_dims: 每个 label 的维大小。
+/// 返回 (输出 flat C 序列表, 输出形状)；out_labels 为空时输出长度 1（标量）。
+#[pyfunction]
+fn einsum_eval(
+    data: Vec<Vec<f64>>,
+    shapes: Vec<Vec<usize>>,
+    terms: Vec<Vec<u32>>,
+    out_labels: Vec<u32>,
+    label_dims: Vec<usize>,
+) -> (Vec<f64>, Vec<usize>) {
+    let _ = &shapes;
+    let n_labels = label_dims.len();
+    let out_shape: Vec<usize> = out_labels.iter().map(|&l| label_dims[l as usize]).collect();
+    let out_total: usize = out_shape.iter().product();
+    let mut acc = vec![0.0f64; out_total.max(1)];
+    // 输出网格 C 序步长（首输出 label 最慢）
+    let mut out_strides = vec![1usize; out_labels.len()];
+    for i in (1..out_labels.len()).rev() {
+        out_strides[i - 1] = out_strides[i] * out_shape[i];
+    }
+    let mut combo = vec![0usize; n_labels];
+    let total: usize = label_dims.iter().product();
+    for _ in 0..total {
+        let mut prod = 1.0f64;
+        for (t, term) in terms.iter().enumerate() {
+            let mut idx = 0usize;
+            let mut stride = 1usize;
+            for &lab in term.iter().rev() {
+                idx += combo[lab as usize] * stride;
+                stride *= label_dims[lab as usize];
+            }
+            prod *= data[t][idx];
+        }
+        let mut okey = 0usize;
+        for (k, &lab) in out_labels.iter().enumerate() {
+            okey += combo[lab as usize] * out_strides[k];
+        }
+        acc[okey] += prod;
+        // odometer 递增（末 label 最快）
+        let mut p = n_labels - 1;
+        loop {
+            combo[p] += 1;
+            if combo[p] < label_dims[p] {
+                break;
+            }
+            combo[p] = 0;
+            if p == 0 {
+                break;
+            }
+            p -= 1;
+        }
+    }
+    (acc, out_shape)
+}
+
+/// ravel_multi_index 核心：逐维 mode（0=raise 1=clip 2=wrap）+ C/F 序 stride 累加。
+/// 输入为各维 flat f64 索引（Python 侧已完成 dims/mode/空数组校验）；
+/// raise 越界 → ValueError（与纯 Python 版信息一致）。
+#[pyfunction]
+#[allow(clippy::needless_range_loop)] // k 跨多个 idxs[d] 数组同位访问，无法改为单迭代器
+fn rmi_flat(idxs: Vec<Vec<f64>>, dims: Vec<i64>, modes: Vec<u8>, order: u8) -> PyResult<Vec<i64>> {
+    let ndim = dims.len();
+    let n = idxs[0].len();
+    // 防御：Python 侧已做广播展平；长度不一致视为输入错误而非 panic
+    for row in &idxs {
+        if row.len() != n {
+            return Err(PyValueError::new_err(
+                "multi_index arrays must have a common broadcast shape",
+            ));
+        }
+    }
+    let mut strides = vec![0i64; ndim];
+    if order == 1 {
+        let mut acc = 1i64;
+        for i in 0..ndim {
+            strides[i] = acc;
+            acc *= dims[i];
+        }
+    } else {
+        let mut acc = 1i64;
+        for i in (0..ndim).rev() {
+            strides[i] = acc;
+            acc *= dims[i];
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for k in 0..n {
+        let mut s = 0i64;
+        for d in 0..ndim {
+            let v = idxs[d][k];
+            if !v.is_finite() || v != v.trunc() {
+                return Err(PyTypeError::new_err("only int indices permitted"));
+            }
+            let ddim = dims[d];
+            match modes[d] {
+                2 => {
+                    let iv = v as i64;
+                    let adj = if iv >= 0 {
+                        iv % ddim
+                    } else {
+                        ((iv % ddim) + ddim) % ddim
+                    };
+                    s += adj * strides[d];
+                }
+                1 => {
+                    let iv = (v as i64).clamp(0, ddim - 1);
+                    s += iv * strides[d];
+                }
+                _ => {
+                    let iv = v as i64;
+                    if iv < 0 || iv >= ddim {
+                        return Err(PyValueError::new_err("indices outside the allowed range"));
+                    }
+                    s += iv * strides[d];
+                }
+            }
+        }
+        out.push(s);
+    }
+    Ok(out)
+}
+
+/// meshgrid：返回各输出数组的 flat C 序列表 + 输出形状。
+/// indexing: 0=xy（n>=2 时交换前两个输出维）、1=ij（恒等）。
+#[pyfunction]
+#[allow(clippy::needless_range_loop)] // p 跨多个 outs[i] 数组同位写入，无法改为单迭代器
+fn meshgrid(arrays: Vec<Vec<f64>>, indexing: u8) -> (Vec<Vec<f64>>, Vec<usize>) {
+    let n = arrays.len();
+    let dims: Vec<usize> = arrays.iter().map(|a| a.len()).collect();
+    let mut perm: Vec<usize> = (0..n).collect();
+    if indexing == 0 && n >= 2 {
+        perm.swap(0, 1);
+    }
+    let out_shape: Vec<usize> = perm.iter().map(|&k| dims[k]).collect();
+    let total: usize = out_shape.iter().product();
+    let mut out_pos = vec![0usize; n];
+    for (k, &i) in perm.iter().enumerate() {
+        out_pos[i] = k;
+    }
+    let mut outs: Vec<Vec<f64>> = (0..n).map(|_| vec![0.0f64; total]).collect();
+    if total == 0 || n == 0 {
+        return (outs, out_shape);
+    }
+    let mut combo = vec![0usize; n];
+    for p in 0..total {
+        for i in 0..n {
+            outs[i][p] = arrays[i][combo[out_pos[i]]];
+        }
+        let mut q = n - 1;
+        loop {
+            combo[q] += 1;
+            if combo[q] < out_shape[q] {
+                break;
+            }
+            combo[q] = 0;
+            if q == 0 {
+                break;
+            }
+            q -= 1;
+        }
+    }
+    (outs, out_shape)
+}
+
+/// meshgrid（core 直连）：输入输出均为 core 数组，零 Python 浮点往返。
+/// indexing: 0=xy（n>=2 交换前两维）、1=ij；sparse: 仅展开自身维。
+/// 复数输入 → TypeError（与纯 Python 旧实现 int(complex) 报错一致）。
+#[pyfunction]
+#[allow(clippy::needless_range_loop)] // p 跨多个 outs[i] 同位写入，无法改为单迭代器
+fn meshgrid_core(arrays: Vec<NdArray>, indexing: u8, sparse: bool) -> PyResult<Vec<NdArray>> {
+    let n = arrays.len();
+    for a in arrays.iter() {
+        if a.imag.is_some() {
+            return Err(PyTypeError::new_err(
+                "can't convert complex to real for meshgrid",
+            ));
+        }
+        if a.data.ndim() > 1 {
+            return Err(PyValueError::new_err("meshgrid inputs must be 1-D"));
+        }
+    }
+    let dims: Vec<usize> = arrays.iter().map(|a| a.data.len()).collect();
+    let mut perm: Vec<usize> = (0..n).collect();
+    if indexing == 0 && n >= 2 {
+        perm.swap(0, 1);
+    }
+    let out_shape: Vec<usize> = perm.iter().map(|&k| dims[k]).collect();
+    let mut out_pos = vec![0usize; n];
+    for (k, &i) in perm.iter().enumerate() {
+        out_pos[i] = k;
+    }
+    if sparse {
+        // 输入拷贝为普通 Vec 后经 into_iter 消费（避免从 Vec 索引 move）
+        let input_vecs: Vec<Vec<f64>> = arrays
+            .iter()
+            .map(|a| a.data.iter().copied().collect())
+            .collect();
+        let mut outs = Vec::with_capacity(n);
+        for (i, vec) in input_vecs.into_iter().enumerate() {
+            let shp: Vec<usize> = (0..n)
+                .map(|k| if k == out_pos[i] { dims[i] } else { 1 })
+                .collect();
+            let data = Array::from_shape_vec(IxDyn(&shp), vec)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            outs.push(NdArray {
+                imag: None,
+                data: data.into_dyn(),
+            });
+        }
+        return Ok(outs);
+    }
+    let total: usize = out_shape.iter().product();
+    let mut outs: Vec<Vec<f64>> = (0..n).map(|_| vec![0.0f64; total]).collect();
+    if total > 0 && n > 0 {
+        let flat: Vec<&[f64]> = arrays
+            .iter()
+            .map(|a| a.data.as_slice().unwrap_or(&[]))
+            .collect();
+        let mut combo = vec![0usize; n];
+        for p in 0..total {
+            for i in 0..n {
+                outs[i][p] = flat[i][combo[out_pos[i]]];
+            }
+            let mut q = n - 1;
+            loop {
+                combo[q] += 1;
+                if combo[q] < out_shape[q] {
+                    break;
+                }
+                combo[q] = 0;
+                if q == 0 {
+                    break;
+                }
+                q -= 1;
+            }
+        }
+    }
+    let mut res = Vec::with_capacity(n);
+    for vec in outs {
+        let data = Array::from_shape_vec(IxDyn(&out_shape), vec)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        res.push(NdArray {
+            imag: None,
+            data: data.into_dyn(),
+        });
+    }
+    Ok(res)
+}
+
+/// einsum 通用路径（core 直连）：输入输出均为 core 数组，零 Python 浮点往返。
+/// 语义与 einsum_eval 相同（f64，加和顺序一致）；复数输入 → TypeError（走 Python 回退）。
+#[pyfunction]
+fn einsum_eval_core(
+    data: Vec<NdArray>,
+    shapes: Vec<Vec<usize>>,
+    terms: Vec<Vec<u32>>,
+    out_labels: Vec<u32>,
+    label_dims: Vec<usize>,
+) -> PyResult<NdArray> {
+    let _ = &shapes;
+    for a in data.iter() {
+        if a.imag.is_some() {
+            return Err(PyTypeError::new_err(
+                "einsum complex not supported in core path",
+            ));
+        }
+    }
+    let n_labels = label_dims.len();
+    // 防御：label id 越界 → 干净报错而非 panic
+    for &lab in terms.iter().flatten().chain(out_labels.iter()) {
+        if lab as usize >= n_labels {
+            return Err(PyValueError::new_err("einsum label id out of range"));
+        }
+    }
+    let out_shape: Vec<usize> = out_labels.iter().map(|&l| label_dims[l as usize]).collect();
+    let out_total: usize = out_shape.iter().product();
+    let mut acc = vec![0.0f64; out_total.max(1)];
+    let mut out_strides = vec![1usize; out_labels.len()];
+    for i in (1..out_labels.len()).rev() {
+        out_strides[i - 1] = out_strides[i] * out_shape[i];
+    }
+    let flat: Vec<&[f64]> = data
+        .iter()
+        .map(|a| a.data.as_slice().unwrap_or(&[]))
+        .collect();
+    let mut combo = vec![0usize; n_labels];
+    let total: usize = label_dims.iter().product();
+    for _ in 0..total {
+        let mut prod = 1.0f64;
+        for (t, term) in terms.iter().enumerate() {
+            let mut idx = 0usize;
+            let mut stride = 1usize;
+            for &lab in term.iter().rev() {
+                idx += combo[lab as usize] * stride;
+                stride *= label_dims[lab as usize];
+            }
+            prod *= flat[t][idx];
+        }
+        let mut okey = 0usize;
+        for (k, &lab) in out_labels.iter().enumerate() {
+            okey += combo[lab as usize] * out_strides[k];
+        }
+        acc[okey] += prod;
+        let mut p = n_labels - 1;
+        loop {
+            combo[p] += 1;
+            if combo[p] < label_dims[p] {
+                break;
+            }
+            combo[p] = 0;
+            if p == 0 {
+                break;
+            }
+            p -= 1;
+        }
+    }
+    let data_arr = Array::from_shape_vec(IxDyn(&out_shape), acc)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        imag: None,
+        data: data_arr.into_dyn(),
+    })
+}
+
+/// ravel_multi_index（core 直连）：输入输出均为 core 数组。
+/// 逐维 mode（"raise"/"clip"/"wrap"）+ C/F 步长 + len-1 输入广播。
+/// bshape 为 Python 侧算好的广播结果形状（空 = 标量输出）。
+#[pyfunction]
+#[allow(clippy::needless_range_loop)] // k 跨多个 flats[d] 同位访问，无法改为单迭代器
+fn rmi_core(
+    multi_index: Vec<NdArray>,
+    dims: Vec<usize>,
+    modes: Vec<String>,
+    bshape: Vec<usize>,
+    order: &str,
+) -> PyResult<NdArray> {
+    let ndim = dims.len();
+    let n: usize = bshape.iter().product();
+    let mut strides = vec![0usize; ndim];
+    if order == "F" {
+        let mut acc = 1usize;
+        for i in 0..ndim {
+            strides[i] = acc;
+            acc *= dims[i];
+        }
+    } else {
+        let mut acc = 1usize;
+        for i in (0..ndim).rev() {
+            strides[i] = acc;
+            acc *= dims[i];
+        }
+    }
+    // 广播校验：各输入长度须为 n 或 1（Python 侧已保证可广播）
+    let flats: Vec<&[f64]> = multi_index
+        .iter()
+        .map(|a| {
+            let v = a.data.as_slice().unwrap_or(&[]);
+            if v.len() != n && v.len() != 1 {
+                return Err(PyValueError::new_err(
+                    "multi_index arrays must be broadcastable to a single shape",
+                ));
+            }
+            Ok(v)
+        })
+        .collect::<PyResult<_>>()?;
+    let mut out = Vec::with_capacity(n.max(1));
+    for k in 0..n {
+        let mut s: i64 = 0;
+        for d in 0..ndim {
+            let v = if flats[d].len() == n {
+                flats[d][k]
+            } else {
+                flats[d][0]
+            };
+            if !v.is_finite() || v != v.trunc() {
+                return Err(PyTypeError::new_err("only int indices permitted"));
+            }
+            let ddim = dims[d] as i64;
+            let iv = match modes[d].as_str() {
+                "wrap" => {
+                    let iv = v as i64;
+                    if iv >= 0 {
+                        iv % ddim
+                    } else {
+                        ((iv % ddim) + ddim) % ddim
+                    }
+                }
+                "clip" => (v as i64).clamp(0, ddim - 1),
+                _ => {
+                    let iv = v as i64;
+                    if iv < 0 || iv >= ddim {
+                        return Err(PyValueError::new_err("indices outside the allowed range"));
+                    }
+                    iv
+                }
+            };
+            s += iv * strides[d] as i64;
+        }
+        out.push(s as f64);
+    }
+    let data = Array::from_shape_vec(IxDyn(&bshape), out)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        imag: None,
+        data: data.into_dyn(),
+    })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(concatenate, m)?)?;
     m.add_function(wrap_pyfunction!(stack, m)?)?;
@@ -1302,6 +1716,12 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(choose, m)?)?;
     m.add_function(wrap_pyfunction!(compress, m)?)?;
     m.add_function(wrap_pyfunction!(copyto, m)?)?;
+    m.add_function(wrap_pyfunction!(einsum_eval, m)?)?;
+    m.add_function(wrap_pyfunction!(rmi_flat, m)?)?;
+    m.add_function(wrap_pyfunction!(meshgrid, m)?)?;
+    m.add_function(wrap_pyfunction!(meshgrid_core, m)?)?;
+    m.add_function(wrap_pyfunction!(einsum_eval_core, m)?)?;
+    m.add_function(wrap_pyfunction!(rmi_core, m)?)?;
     Ok(())
 }
 

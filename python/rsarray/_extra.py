@@ -10,6 +10,8 @@ import builtins
 import cmath as _cmath
 import math as _math
 import re as _re
+import struct as _struct
+import contextvars as _contextvars
 
 import rsarray.num_core as _core
 
@@ -2818,43 +2820,14 @@ def ravel_multi_index(multi_index, dims, mode='raise', order='C'):
             nd = _np().ndarray
             return nd(_reshape_list([], _bshape), _dtype='int64')
         raise ValueError("indices outside the allowed range")
-    _flats = [_flat(_m) for _m in idxs]
-    _n = 1
-    for _d0 in _bshape:
-        _n *= _d0
-    # 步长（C 序 / F 序）
-    if order == 'F':
-        _strides = []
-        _s = 1
-        for _d0 in dims_list:
-            _strides.append(_s)
-            _s *= _d0
-    else:
-        _strides = [1] * _ndim
-        for _d0 in range(_ndim - 2, -1, -1):
-            _strides[_d0] = _strides[_d0 + 1] * dims_list[_d0 + 1]
-    _res = []
-    for _i in range(_n):
-        _v = 0
-        for _d0 in range(_ndim):
-            _x = _flats[_d0][_i]
-            _dd = dims_list[_d0]
-            _mo = modes[_d0]
-            if _mo == 'wrap':
-                _x = _x % _dd
-            elif _mo == 'clip':
-                if _x < 0:
-                    _x = 0
-                elif _x > _dd - 1:
-                    _x = _dd - 1
-            elif _x < 0 or _x >= _dd:
-                raise ValueError("indices outside the allowed range")
-            _v += _x * _strides[_d0]
-        _res.append(_v)
+    # 核心计算（逐维 mode raise/clip/wrap + C/F 步长 + 广播）在 Rust：
+    # _core.rmi_core core 直连，零 Python 浮点往返
+    _res = _core.rmi_core(
+        [_m._array for _m in idxs], dims_list, list(modes),
+        list(_bshape), str(order))
     if _bshape == ():
-        return builtins.int(_res[0])
-    nd = _np().ndarray
-    return nd(_reshape_list(_res, _bshape), _dtype='int64')
+        return builtins.int(_wrap(_res).tolist())
+    return _wrap(_res, _dtype='int64')
 
 
 # ========== 沿轴应用 / 分段函数 ==========
@@ -3768,7 +3741,6 @@ class printoptions:
 # - trim: 'k'=保留, '.'=去零留点, '0'=留一个零, '-'=去零去点
 # - positional 永不切换科学记数；scientific 恒科学记数
 # - 输出缓冲 16384（Dragon4_Scratch.repr），超出 RuntimeError
-import struct as _struct
 
 _D4_SPECS = {
     # dt: (struct fmt, 总位数, 次正规最小指数, bias, 尾数位数)
@@ -4169,7 +4141,6 @@ def _float_scalar_str(v, dt):
 # 2.x 语义：状态存于 contextvars —— 每个 asyncio Task / 线程有独立
 # 上下文副本，errstate 的 set/reset 经 token 恢复，天然并发安全（官方
 # test_asyncio_safe 依赖此语义：交叉的上下文互不破坏）。
-import contextvars as _contextvars
 
 _ERR_DEFAULT = {'divide': 'warn', 'over': 'warn', 'under': 'ignore',
                 'invalid': 'warn'}
@@ -4264,6 +4235,7 @@ def _fp_arith_check(num, oth, res, op):
         return
     try:
         _TINY64 = 2.2250738585072014e-308
+
         def _flat(x):
             if isinstance(x, (list, tuple)):
                 out = []
@@ -5181,9 +5153,38 @@ def einsum(subscripts, *operands, **kwargs):
     dimsize = {label: arr.shape[k]
                for term, arr in zip(in_terms, arrs)
                for k, label in enumerate(term)}
+    # 同一 label 跨输入维大小冲突 → 显式报错（原先静默覆盖）；
+    # 必须按出现位置比对（dimsize 字典推导已折叠重复 label）
+    _seen = {}
+    for _term, _arr in zip(in_terms, arrs):
+        for _k, _lab in enumerate(_term):
+            _sz = _arr.shape[_k]
+            if _lab in _seen and _seen[_lab] != _sz:
+                raise ValueError(
+                    f"Size of label {_lab!r} does not match across operands")
+            _seen[_lab] = _sz
     all_labels = list(dimsize.keys())
     out_labels = list(out)
     label_pos = {lab: i for i, lab in enumerate(all_labels)}
+    n_terms = len(in_terms)
+
+    # 热点下放 Rust：全笛卡尔积累加走 _core.einsum_eval_core
+    #（core 直连，零 Python 浮点往返；加和顺序与纯 Python 版一致）；
+    # complex / 空维回退纯 Python。
+    # 注意：本模块 any/all 被 rsarray 数组函数遮蔽，必须用 builtins 版本
+    _has_complex = builtins.any(
+        'complex' in str(getattr(a, '_dtype', '')) for a in arrs)
+    if not _has_complex and builtins.all(dimsize[lb] > 0 for lb in all_labels):
+        _lids = {lab: i for i, lab in enumerate(all_labels)}
+        _term_ids = [[_lids[lab] for lab in term] for term in in_terms]
+        _res = _core.einsum_eval_core(
+            [a._array for a in arrs], [tuple(a.shape) for a in arrs],
+            _term_ids, [_lids[lab] for lab in out_labels],
+            [dimsize[lab] for lab in all_labels])
+        if not out_labels:
+            return _wrap(_res, _dtype='float64').tolist()
+        return _wrap(_res, _dtype='float64')
+
     lists = [a.tolist() for a in arrs]
 
     # 预计算每个 term 的 label_pos 索引，避免在 get() 中重复查找
@@ -5198,7 +5199,6 @@ def einsum(subscripts, *operands, **kwargs):
 
     acc = {}
     ranges = [builtin_range(dimsize[lab]) for lab in all_labels]
-    n_terms = len(in_terms)
     for combo in _it.product(*ranges):
         prod = 1.0
         for term_idx in range(n_terms):
@@ -6600,7 +6600,7 @@ __all__ = [
     "chunked_apply", "mmap_array", "LazyArray",
     "VarStringArray", "BigIntArray",
     "var_string_array", "bigint_array",
-    "detect_integer_overflow", "smart_int_array",
+    "detect_integer_overflow", "smart_int_array", "polyint", "polyder", "polyval", "polyadd",
 ]
 
 
@@ -6616,6 +6616,4 @@ promote_types.__text_signature__ = "(type1, type2)"
 # 实现见 polynomial/_npcompat.py：poly1d 对齐排版/pq 元组/polyfit cov/
 # roots dtype 保持等）。此处 re-import 使模块属性指向新实现，
 # __init__.py 的 __all__ 挂载循环随之导出新版本。 ----
-from .polynomial._npcompat import (  # noqa: E402,F401
-    poly, roots, polyint, polyder, polyval, polyadd,
-    polysub, polymul, polydiv, poly1d)
+from .polynomial._npcompat import (poly, roots, polyint, polyder, polyval, polyadd, polysub, polymul, polydiv, poly1d)  # noqa 
