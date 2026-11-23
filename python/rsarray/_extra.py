@@ -736,10 +736,44 @@ def intersect1d(ar1, ar2, assume_unique=False, return_indices=False):
     npmod = _np()
     a = _asarray(ar1)
     b = _asarray(ar2)
+    # 数值非复数 + 无需索引：core 直连（Rust 排序归并，替代 O(n²) 去重）
+    # 注意：本模块 all 被 rsarray 数组函数遮蔽
+    if not return_indices and builtins.all(
+            str(getattr(x, '_dtype', ''))[:1] in ('f', 'i', 'u', 'b')
+            for x in (a, b)):
+        try:
+            _dt = npmod.result_type(a, b)
+        except Exception:
+            _dt = a.dtype
+        return _wrap(_core.intersect1d(a._array, b._array), _dtype=_dt)
 
     def _flat_vals(x):
-        t = x.ravel().tolist()
-        return list(t) if isinstance(t, (list, tuple)) else [t]
+        # 注意：string_ 数组 ravel() 会丢字符串表（回退 f64 占位 0.0），
+        # 必须用 tolist() 递归展平（object 数组按 shape 深度展平，不递归进元素）
+        t = x.tolist()
+        out = []
+        if (getattr(x, '_dtype', None) == 'object'
+                or str(getattr(x, 'dtype', '')) == 'object'):
+            def rec_o(v, d):
+                if d == 0:
+                    out.append(v)
+                    return
+                for w in v:
+                    rec_o(w, d - 1)
+
+            rec_o(t if isinstance(t, (list, tuple)) else [t],
+                  len(tuple(getattr(x, 'shape', ()))))
+            return out
+
+        def rec(v):
+            if isinstance(v, (list, tuple)):
+                for w in v:
+                    rec(w)
+            else:
+                out.append(v)
+
+        rec(t if isinstance(t, (list, tuple)) else [t])
+        return out
 
     def _eq(v, w):
         if v is w:
@@ -1910,9 +1944,20 @@ def kron(a, b):
                 _subcls = _t
     A = _asarray(a)
     B = _asarray(b)
-    if A.ndim == 1 and B.ndim == 1:
+    # 数值非复数：core 直连（Rust 一次性乘积，替代 product+take+tile 三段式）
+    # 注意：本模块 all 被 rsarray 数组函数遮蔽
+    if builtins.all(
+            str(getattr(x, '_dtype', ''))[:1] in ('f', 'i', 'u', 'b')
+            for x in (A, B)):
+        try:
+            _dt = np.result_type(A, B)
+        except Exception:
+            _dt = getattr(A, '_dtype', None) or 'float64'
+        res = _wrap(_core.kron_core(A._array, B._array), _dtype=_dt)
+    elif A.ndim == 1 and B.ndim == 1:
         res = outer(A, B).ravel()
     else:
+        # 非数值（字符串/object 等）：原通用路径
         # 数组语义：kron[a_idx * bsh + b_idx] = a[a_idx] * b[b_idx]。
         # 等价于 tile(A, bsh) 逐块重复 × B 逐元素展开（repeat ash 次）。
         _nd2 = builtins.max(A.ndim, B.ndim)

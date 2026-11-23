@@ -1675,6 +1675,85 @@ fn rmi_core(
     })
 }
 
+/// kron（core 直连）：C 序 flat 下 out[p] = a[ia] * b[ib]，
+/// a/b 前缀补 1 对齐维数；输出形状 out_shape[d] = ash[d] * bsh[d]。
+/// 复数输入 → TypeError（Python 侧回退）。
+#[pyfunction]
+#[allow(clippy::needless_range_loop)] // p/d 跨 combo 与多数组同位访问，无法改为单迭代器
+fn kron_core(a: &NdArray, b: &NdArray) -> PyResult<NdArray> {
+    if a.imag.is_some() || b.imag.is_some() {
+        return Err(PyTypeError::new_err(
+            "kron complex not supported in core path",
+        ));
+    }
+    let af = a
+        .data
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("kron: non-contiguous input"))?;
+    let bf = b
+        .data
+        .as_slice()
+        .ok_or_else(|| PyValueError::new_err("kron: non-contiguous input"))?;
+    // IxDyn 的 shape() 直接返回 &[usize]
+    let ash_all: Vec<usize> = a.data.shape().to_vec();
+    let bsh_all: Vec<usize> = b.data.shape().to_vec();
+    let n2 = std::cmp::max(ash_all.len(), bsh_all.len());
+    let pad_a = n2 - ash_all.len();
+    let pad_b = n2 - bsh_all.len();
+    let ash: Vec<usize> = (0..n2)
+        .map(|k| if k >= pad_a { ash_all[k - pad_a] } else { 1 })
+        .collect();
+    let bsh: Vec<usize> = (0..n2)
+        .map(|k| if k >= pad_b { bsh_all[k - pad_b] } else { 1 })
+        .collect();
+    let out_shape: Vec<usize> = ash.iter().zip(&bsh).map(|(x, y)| x * y).collect();
+    let total: usize = out_shape.iter().product();
+    let mut sa = vec![1usize; n2];
+    let mut sb = vec![1usize; n2];
+    for i in (1..n2).rev() {
+        sa[i - 1] = sa[i] * ash[i];
+        sb[i - 1] = sb[i] * bsh[i];
+    }
+    let mut out = vec![0.0f64; total.max(1)];
+    if total == 0 {
+        out.clear();
+    } else if n2 == 0 {
+        // 双 0-d：唯一元素直接相乘
+        out[0] = af[0] * bf[0];
+    } else {
+        let mut combo = vec![0usize; n2];
+        for p in 0..total {
+            let mut ia = 0usize;
+            let mut ib = 0usize;
+            for d in 0..n2 {
+                let c = combo[d];
+                ia += (c / bsh[d]) * sa[d];
+                ib += (c % bsh[d]) * sb[d];
+            }
+            out[p] = af[ia] * bf[ib];
+            // odometer（末维最快，C 序遍历）
+            let mut q = n2 - 1;
+            loop {
+                combo[q] += 1;
+                if combo[q] < out_shape[q] {
+                    break;
+                }
+                combo[q] = 0;
+                if q == 0 {
+                    break;
+                }
+                q -= 1;
+            }
+        }
+    }
+    let data = Array::from_shape_vec(IxDyn(&out_shape), out)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        imag: None,
+        data: data.into_dyn(),
+    })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(concatenate, m)?)?;
     m.add_function(wrap_pyfunction!(stack, m)?)?;
@@ -1722,6 +1801,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(meshgrid_core, m)?)?;
     m.add_function(wrap_pyfunction!(einsum_eval_core, m)?)?;
     m.add_function(wrap_pyfunction!(rmi_core, m)?)?;
+    m.add_function(wrap_pyfunction!(kron_core, m)?)?;
     Ok(())
 }
 

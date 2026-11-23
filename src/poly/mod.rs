@@ -486,6 +486,241 @@ fn poly_from_roots(roots: &NdArray) -> NdArray {
     }
 }
 
+// ========== core 直连求值 / Vandermonde（零 Python 浮点往返） ==========
+
+/// 广播形状计算（冲突返回 None）。
+fn bcast_shape(shapes: &[Vec<usize>]) -> Option<Vec<usize>> {
+    let ndim = shapes.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut out = vec![1usize; ndim];
+    for s in shapes {
+        let pad = ndim - s.len();
+        for (d, &v) in s.iter().enumerate() {
+            let dd = d + pad;
+            if out[dd] == 1 {
+                out[dd] = v;
+            } else if v != 1 && v != out[dd] {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// 广播取数：src 为数组自身逻辑序（视图的 C 序）flat，src_shape 前缀补 1
+/// 到 bshape 的 ndim，输出长度 Π bshape（C 序坐标按各维取模回源）。
+fn bcast_to(src: Vec<f64>, src_shape: Vec<usize>, bshape: &[usize]) -> Vec<f64> {
+    let ndim = bshape.len();
+    let pad = ndim.saturating_sub(src_shape.len());
+    // 源 C 序步长（按输出维索引；补位维步长因子为 1）
+    let mut sstride = vec![1usize; ndim];
+    for i in (1..ndim).rev() {
+        let sd = if i >= pad { src_shape[i - pad] } else { 1 };
+        sstride[i - 1] = sstride[i] * sd;
+    }
+    let mut out = vec![0.0f64; bshape.iter().product()];
+    for (k, slot) in out.iter_mut().enumerate() {
+        let mut sidx = 0usize;
+        let mut rem = k;
+        for d in (0..ndim).rev() {
+            let c = rem % bshape[d];
+            rem /= bshape[d];
+            if d >= pad {
+                let sd = src_shape[d - pad];
+                if sd != 1 {
+                    sidx += (c % sd) * sstride[d];
+                }
+            }
+        }
+        *slot = src[sidx];
+    }
+    out
+}
+
+/// polyvander（core 直连）：输出形状 x.shape + (deg+1,)，
+/// out[..., k, i] = x[..., k]^i（i = 0..=deg）。
+#[pyfunction]
+fn vander_core(x: &NdArray, deg: usize) -> PyResult<NdArray> {
+    if x.imag.is_some() {
+        return Err(PyTypeError::new_err(
+            "polyvander complex not supported in core path",
+        ));
+    }
+    let xv: Vec<f64> = x.data.iter().copied().collect();
+    let mut oshape: Vec<usize> = x.data.shape().to_vec();
+    oshape.push(deg + 1);
+    let mut out = vec![0.0f64; xv.len() * (deg + 1)];
+    for (k, &v) in xv.iter().enumerate() {
+        let base = k * (deg + 1);
+        for i in 0..=deg {
+            out[base + i] = v.powi(i as i32);
+        }
+    }
+    let data = Array::from_shape_vec(IxDyn(&oshape), out)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        imag: None,
+        data: data.into_dyn(),
+    })
+}
+
+/// polyvander2d（core 直连）：x, y 广播到 bshape，输出形状 bshape + (d0*d1,)，
+/// out[k, i*d1+j] = x[k]^i * y[k]^j（C 序网格）。
+#[pyfunction]
+fn vander2d_core(x: &NdArray, y: &NdArray, d0: usize, d1: usize) -> PyResult<NdArray> {
+    if x.imag.is_some() || y.imag.is_some() {
+        return Err(PyTypeError::new_err(
+            "polyvander2d complex not supported in core path",
+        ));
+    }
+    let xsh: Vec<usize> = x.data.shape().to_vec();
+    let ysh: Vec<usize> = y.data.shape().to_vec();
+    let bshape = bcast_shape(&[xsh.clone(), ysh.clone()])
+        .ok_or_else(|| PyValueError::new_err("incompatible point dimensions in polyvander2d"))?;
+    let npts: usize = bshape.iter().product();
+    let xv = bcast_to(x.data.iter().copied().collect(), xsh, &bshape);
+    let yv = bcast_to(y.data.iter().copied().collect(), ysh, &bshape);
+    let mut out = vec![0.0f64; npts * d0 * d1];
+    for (k, (&x, &y)) in xv.iter().zip(yv.iter()).enumerate() {
+        let base = k * d0 * d1;
+        for i in 0..d0 {
+            let xi = x.powi(i as i32);
+            for j in 0..d1 {
+                out[base + i * d1 + j] = xi * y.powi(j as i32);
+            }
+        }
+    }
+    let mut oshape = bshape;
+    oshape.push(d0 * d1);
+    let data = Array::from_shape_vec(IxDyn(&oshape), out)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        imag: None,
+        data: data.into_dyn(),
+    })
+}
+
+/// polyvander3d（core 直连）：x, y, z 广播到 bshape，输出形状 bshape + (d0*d1*d2,)，
+/// out[k, (i*d1+j)*d2+t] = x[k]^i * y[k]^j * z[k]^t（C 序网格）。
+#[pyfunction]
+fn vander3d_core(
+    x: &NdArray,
+    y: &NdArray,
+    z: &NdArray,
+    d0: usize,
+    d1: usize,
+    d2: usize,
+) -> PyResult<NdArray> {
+    if x.imag.is_some() || y.imag.is_some() || z.imag.is_some() {
+        return Err(PyTypeError::new_err(
+            "polyvander3d complex not supported in core path",
+        ));
+    }
+    let xsh: Vec<usize> = x.data.shape().to_vec();
+    let ysh: Vec<usize> = y.data.shape().to_vec();
+    let zsh: Vec<usize> = z.data.shape().to_vec();
+    let bshape = bcast_shape(&[xsh.clone(), ysh.clone(), zsh.clone()])
+        .ok_or_else(|| PyValueError::new_err("incompatible point dimensions in polyvander3d"))?;
+    let npts: usize = bshape.iter().product();
+    let xv = bcast_to(x.data.iter().copied().collect(), xsh, &bshape);
+    let yv = bcast_to(y.data.iter().copied().collect(), ysh, &bshape);
+    let zv = bcast_to(z.data.iter().copied().collect(), zsh, &bshape);
+    let mut out = vec![0.0f64; npts * d0 * d1 * d2];
+    for (k, ((&x, &y), &z)) in xv.iter().zip(yv.iter()).zip(zv.iter()).enumerate() {
+        let base = k * d0 * d1 * d2;
+        for i in 0..d0 {
+            let xi = x.powi(i as i32);
+            for j in 0..d1 {
+                let yij = xi * y.powi(j as i32);
+                for t in 0..d2 {
+                    out[base + (i * d1 + j) * d2 + t] = yij * z.powi(t as i32);
+                }
+            }
+        }
+    }
+    let mut oshape = bshape;
+    oshape.push(d0 * d1 * d2);
+    let data = Array::from_shape_vec(IxDyn(&oshape), out)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        imag: None,
+        data: data.into_dyn(),
+    })
+}
+
+/// polyvalnd（core 直连）：c 为 ndim 维系数数组，pts 为 ndim 个点数组
+/// （广播到 bshape），输出形状 = bshape，
+/// out[k] = Σ_{idx} cv[ci] * Π_a x_a[k]^idx[a]。
+/// 系数按 C 序 odometer 迭代（与纯 Python 逐项累加顺序一致，逐位可复现），
+/// 零系数项跳过。
+#[pyfunction]
+fn polyvalnd_core(c: &NdArray, pts: Vec<NdArray>, bshape: Vec<usize>) -> PyResult<NdArray> {
+    if c.imag.is_some() || pts.iter().any(|p| p.imag.is_some()) {
+        return Err(PyTypeError::new_err(
+            "polyvalnd complex not supported in core path",
+        ));
+    }
+    let cv: Vec<f64> = c.data.iter().copied().collect();
+    let cshape: Vec<usize> = c.data.shape().to_vec();
+    let nd = cshape.len();
+    let a = pts.len();
+    if a != nd {
+        return Err(PyValueError::new_err(
+            "polyvalnd: coef ndim must equal number of points",
+        ));
+    }
+    let npts: usize = bshape.iter().product();
+    let pv: Vec<Vec<f64>> = pts
+        .iter()
+        .map(|p| {
+            let sh: Vec<usize> = p.data.shape().to_vec();
+            bcast_to(p.data.iter().copied().collect(), sh, &bshape)
+        })
+        .collect();
+    let mut out = vec![0.0f64; npts];
+    let ctotal: usize = cshape.iter().product();
+    let mut idx = vec![0usize; nd];
+    for _ in 0..ctotal {
+        let mut ci = 0usize;
+        for (i, &d) in idx.iter().enumerate() {
+            ci = ci * cshape[i] + d;
+        }
+        let cval = cv[ci];
+        if cval != 0.0 {
+            for k in 0..npts {
+                let mut term = cval;
+                for p in 0..a {
+                    let e = idx[p];
+                    if e > 0 {
+                        term *= pv[p][k].powi(e as i32);
+                    }
+                }
+                out[k] += term;
+            }
+        }
+        // odometer（末维最快，C 序）
+        if nd > 0 {
+            let mut q = nd - 1;
+            loop {
+                idx[q] += 1;
+                if idx[q] < cshape[q] {
+                    break;
+                }
+                idx[q] = 0;
+                if q == 0 {
+                    break;
+                }
+                q -= 1;
+            }
+        }
+    }
+    let data = Array::from_shape_vec(IxDyn(&bshape), out)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        imag: None,
+        data: data.into_dyn(),
+    })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(polyval_rs, m)?)?;
     m.add_function(wrap_pyfunction!(polyder_rs, m)?)?;
@@ -497,5 +732,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(polymul, m)?)?;
     m.add_function(wrap_pyfunction!(polydiv, m)?)?;
     m.add_function(wrap_pyfunction!(poly_from_roots, m)?)?;
+    m.add_function(wrap_pyfunction!(vander_core, m)?)?;
+    m.add_function(wrap_pyfunction!(vander2d_core, m)?)?;
+    m.add_function(wrap_pyfunction!(vander3d_core, m)?)?;
+    m.add_function(wrap_pyfunction!(polyvalnd_core, m)?)?;
     Ok(())
 }
