@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 use ndarray::linalg::Dot;
-use ndarray::{Array, Ix2, IxDyn};
+use ndarray::{Array, Ix2, Ix3, IxDyn};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
@@ -224,11 +224,228 @@ fn matmul(_py: Python<'_>, a: &NdArray, b: &NdArray) -> PyResult<NdArray> {
             });
         }
 
+        // stacked（批处理）matmul：批维广播 (B...,m,k) @ (C...,k,n) → (B',...,m,n)，
+        // 1-D 边归一成 (1,k)/(k,1) 参与计算再 reshape 回 (B',...,m,)/(B',...,n,)。
+        // Rust rayon 并行内核，替代 _matmul_fallback 的逐批 Python 循环。
+        if let Some(res) = batched_matmul(a, b) {
+            return res;
+        }
+
         Err(PyValueError::new_err(format!(
             "Unsupported shapes for matmul: {:?} and {:?}",
             a_shape, b_shape
         )))
     })
+}
+
+/// 批维广播：右对齐逐维，须相等或有一侧为 1。
+/// 返回 (out_batch_shape, a_广播(取 batch 0), b_广播)；不匹配返回 None。
+fn broadcast_batches(a_batch: &[usize], b_batch: &[usize]) -> Option<(Vec<usize>, bool, bool)> {
+    let nd = a_batch.len().max(b_batch.len());
+    let mut out = vec![1usize; nd];
+    let mut a_bc = false;
+    let mut b_bc = false;
+    for p in 0..nd {
+        let da = if p < a_batch.len() {
+            a_batch[a_batch.len() - 1 - p]
+        } else {
+            1
+        };
+        let db = if p < b_batch.len() {
+            b_batch[b_batch.len() - 1 - p]
+        } else {
+            1
+        };
+        match (da, db) {
+            (1, 1) => {}
+            (1, _) => {
+                out[nd - 1 - p] = db;
+                a_bc = true;
+            }
+            (_, 1) => {
+                out[nd - 1 - p] = da;
+                b_bc = true;
+            }
+            (x, y) if x == y => out[nd - 1 - p] = x,
+            _ => return None,
+        }
+    }
+    Some((out, a_bc, b_bc))
+}
+
+/// 批量 matmul 实数内核：a (B,m,k) @ b (B,k,n) → (B,m,n) flat（C 序），rayon 按批并行。
+/// a_bc/b_bc 为 true 时该侧恒取 batch 0（其批维是被广播的 1）。
+#[allow(clippy::too_many_arguments)]
+fn matmul_batched_real(
+    a: &Array<f64, Ix3>,
+    b: &Array<f64, Ix3>,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    a_bc: bool,
+    b_bc: bool,
+) -> Vec<f64> {
+    let results: Vec<Vec<f64>> = crate::threadpool::with_pool(|| {
+        (0..batch)
+            .into_par_iter()
+            .map(|bi| {
+                let ai = if a_bc { 0 } else { bi };
+                let bj = if b_bc { 0 } else { bi };
+                let mut out = vec![0.0f64; m * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut sum = 0.0f64;
+                        for kk in 0..k {
+                            sum += a[[ai, i, kk]] * b[[bj, kk, j]];
+                        }
+                        out[i * n + j] = sum;
+                    }
+                }
+                out
+            })
+            .collect()
+    });
+    let mut flat = Vec::with_capacity(batch * m * n);
+    for r in results {
+        flat.extend(r);
+    }
+    flat
+}
+
+/// 批量 matmul 复数内核：(re,im) 逐元素乘加融合，输出 (B,m,n) flat 的 re/im。
+#[allow(clippy::too_many_arguments)]
+fn matmul_batched_complex(
+    ar: &Array<f64, Ix3>,
+    ai: &Array<f64, Ix3>,
+    br: &Array<f64, Ix3>,
+    bi: &Array<f64, Ix3>,
+    batch: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+    a_bc: bool,
+    b_bc: bool,
+) -> (Vec<f64>, Vec<f64>) {
+    let results: Vec<(Vec<f64>, Vec<f64>)> = crate::threadpool::with_pool(|| {
+        (0..batch)
+            .into_par_iter()
+            .map(|b| {
+                let ab = if a_bc { 0 } else { b };
+                let bb = if b_bc { 0 } else { b };
+                let mut re = vec![0.0f64; m * n];
+                let mut im = vec![0.0f64; m * n];
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut srr = 0.0f64;
+                        let mut sri = 0.0f64;
+                        let mut sir = 0.0f64;
+                        let mut sii = 0.0f64;
+                        for kk in 0..k {
+                            let ar_ = ar[[ab, i, kk]];
+                            let ai_ = ai[[ab, i, kk]];
+                            let br_ = br[[bb, kk, j]];
+                            let bi_ = bi[[bb, kk, j]];
+                            srr += ar_ * br_;
+                            sri += ar_ * bi_;
+                            sir += ai_ * br_;
+                            sii += ai_ * bi_;
+                        }
+                        re[i * n + j] = srr - sii;
+                        im[i * n + j] = sri + sir;
+                    }
+                }
+                (re, im)
+            })
+            .collect()
+    });
+    let cap = batch * m * n;
+    let mut re = Vec::with_capacity(cap);
+    let mut im = Vec::with_capacity(cap);
+    for (rr, ii) in results {
+        re.extend(rr);
+        im.extend(ii);
+    }
+    (re, im)
+}
+
+/// stacked（批处理）matmul 入口：(B...,m,k) @ (C...,k,n) → (B',...,m,n)（批维广播），
+/// 1-D 边归一成 (1,k)/(k,1)（结果去掉归一维）。
+/// 形状无法按批处理 matmul 解释时返回 None，由调用方报 Unsupported。
+fn batched_matmul(a: &NdArray, b: &NdArray) -> Option<PyResult<NdArray>> {
+    let a_shape = a.data.shape().to_vec();
+    let b_shape = b.data.shape().to_vec();
+    let a_len = a_shape.len();
+    let b_len = b_shape.len();
+    if a_len == 0 || b_len == 0 {
+        return None;
+    }
+    let (m, k_a, a_batch) = if a_len == 1 {
+        (1, a_shape[0], Vec::new())
+    } else {
+        (
+            a_shape[a_len - 2],
+            a_shape[a_len - 1],
+            a_shape[..a_len - 2].to_vec(),
+        )
+    };
+    // b 是 (..., k, n)：倒数第二维是内维 k_b，最后一维是输出维 n
+    let (n, k_b, b_batch) = if b_len == 1 {
+        (1, b_shape[0], Vec::new())
+    } else {
+        (
+            b_shape[b_len - 1],
+            b_shape[b_len - 2],
+            b_shape[..b_len - 2].to_vec(),
+        )
+    };
+    if k_a != k_b {
+        return None;
+    }
+    let k = k_a;
+    let (batch_shape, a_bc, b_bc) = broadcast_batches(&a_batch, &b_batch)?;
+    let a_tot: usize = a_batch.iter().product();
+    let b_tot: usize = b_batch.iter().product();
+    // to_shape 返回 CowArray（可能是视图），to_owned 落为拥有的 Ix3 数组
+    let a3 = a.data.to_shape((a_tot, m, k)).ok()?.to_owned();
+    let b3 = b.data.to_shape((b_tot, k, n)).ok()?.to_owned();
+    let batch: usize = batch_shape.iter().product();
+
+    let mut out_shape = batch_shape;
+    if a_len > 1 {
+        out_shape.push(m);
+    }
+    if b_len > 1 {
+        out_shape.push(n);
+    }
+
+    if !a.has_imag() && !b.has_imag() {
+        let flat = matmul_batched_real(&a3, &b3, batch, m, k, n, a_bc, b_bc);
+        let data = Array::from_shape_vec(IxDyn(&out_shape), flat)
+            .ok()?
+            .into_dyn();
+        return Some(Ok(NdArray { imag: None, data }));
+    }
+
+    let a_im = match a.imag.as_ref() {
+        Some(im) => im.to_shape((a_tot, m, k)).ok()?.to_owned(),
+        None => Array::zeros((a_tot, m, k)),
+    };
+    let b_im = match b.imag.as_ref() {
+        Some(im) => im.to_shape((b_tot, k, n)).ok()?.to_owned(),
+        None => Array::zeros((b_tot, k, n)),
+    };
+    let (re, im) = matmul_batched_complex(&a3, &a_im, &b3, &b_im, batch, m, k, n, a_bc, b_bc);
+    let data = Array::from_shape_vec(IxDyn(&out_shape), re)
+        .ok()?
+        .into_dyn();
+    let imag = Array::from_shape_vec(IxDyn(&out_shape), im)
+        .ok()?
+        .into_dyn();
+    Some(Ok(NdArray {
+        imag: Some(imag),
+        data,
+    }))
 }
 
 /// 矩阵求逆 (2x2, 3x3)

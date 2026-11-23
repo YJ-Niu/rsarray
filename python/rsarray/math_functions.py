@@ -817,9 +817,11 @@ def _isclose_arrays(arr_a, arr_b, rtol, atol, equal_nan):
     def _bcast(flat, shp):
         """把 flat 值按 shp 广播到 _out_shape，返回展平列表。"""
         shp = (1,) * (_ndim - len(shp)) + tuple(shp)
+        # 用输入自身（左补齐 1 后）的 C 连续步长，而非输出形状步长：
+        # 否则 (N,1)×(1,M) 类前导广播维会越界
         _strides = [1] * _ndim
         for _i in range(_ndim - 2, -1, -1):
-            _strides[_i] = _strides[_i + 1] * _out_shape[_i + 1]
+            _strides[_i] = _strides[_i + 1] * shp[_i + 1]
         _ost = [0 if shp[_i] == 1 else _strides[_i] for _i in range(_ndim)]
         _res = []
         _idx = [0] * _ndim
@@ -933,6 +935,16 @@ def isclose(a, b, rtol=1e-05, atol=1e-08, equal_nan=False):
                 rtol = _round_scalar_to_f(_dt_a, rtol)
         except Exception:
             pass
+    # 快路径：可广播形状 → Rust 逐元素内核（含通用 N 维广播）；
+    # 数组 rtol/atol 等情形回退下方全 Python 广播路径
+    try:
+        _fast = _core.isclose(
+            arr_a._array, arr_b._array,
+            builtins.float(rtol), builtins.float(atol),
+            builtins.bool(equal_nan))
+        return _wrap_bool(_fast)
+    except (ValueError, TypeError, AttributeError):
+        pass
     res = _isclose_arrays(arr_a, arr_b, rtol, atol, equal_nan)
     return res
 

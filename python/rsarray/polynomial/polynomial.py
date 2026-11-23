@@ -658,12 +658,23 @@ def polyvander(x, deg):
         raise ValueError("deg must be non-negative")
     NX = _NX()
     x = NX.asarray(x)
+    # 数值：core 直连（Rust 逐行整数幂，零 Python 往返）
+    _dt = str(getattr(x, '_dtype', ''))
+    if _dt[:1] in ('f', 'i', 'u', 'b'):
+        try:
+            out = _wrap(_core().vander_core(x._array, int(deg)))
+        except Exception:
+            out = None
+        if out is not None:
+            if _dt[:1] in ('i', 'u', 'b'):
+                out = out.astype('int64')  # 原路径 int 幂为 Python int → int64
+            return out
     xv = x.tolist()
 
     def rec(v):
         if isinstance(v, (list, tuple)):
             return [rec(u) for u in v]
-        return [v ** i for i in range(deg + 1)]
+        return [v ** i for i in range(builtins.int(deg) + 1)]
 
     return NX.array(rec(xv))
 
@@ -730,6 +741,19 @@ def polyvander2d(x, y, deg):
     bshape = _broadcast_shape((xs, ys))
     npts = _flat_shape(bshape)
     gridlen = (deg[0] + 1) * (deg[1] + 1)
+    # 数值：core 直连（Rust 内广播 + C 序网格幂积，零 Python 往返）
+    _tx = str(getattr(x, '_dtype', ''))[:1]
+    _ty = str(getattr(y, '_dtype', ''))[:1]
+    if _tx in ('f', 'i', 'u', 'b') and _ty in ('f', 'i', 'u', 'b'):
+        try:
+            out = _wrap(_core().vander2d_core(
+                x._array, y._array, int(deg[0]) + 1, int(deg[1]) + 1))
+        except Exception:
+            out = None
+        if out is not None:
+            if _tx in ('i', 'u', 'b') and _ty in ('i', 'u', 'b'):
+                out = out.astype('int64')  # 原路径 int 幂积为 Python int → int64
+            return out
     xv = _broadcast_flat(x, bshape)
     yv = _broadcast_flat(y, bshape)
     data = []
@@ -755,6 +779,23 @@ def polyvander3d(x, y, z, deg):
     bshape = _broadcast_shape(shapes)
     npts = _flat_shape(bshape)
     gridlen = (deg[0] + 1) * (deg[1] + 1) * (deg[2] + 1)
+    # 数值：core 直连（Rust 内广播 + C 序网格幂积，零 Python 往返）
+    _tx = str(getattr(x, '_dtype', ''))[:1]
+    _ty = str(getattr(y, '_dtype', ''))[:1]
+    _tz = str(getattr(z, '_dtype', ''))[:1]
+    if _tx in ('f', 'i', 'u', 'b') and _ty in ('f', 'i', 'u', 'b') \
+            and _tz in ('f', 'i', 'u', 'b'):
+        try:
+            out = _wrap(_core().vander3d_core(
+                x._array, y._array, z._array,
+                int(deg[0]) + 1, int(deg[1]) + 1, int(deg[2]) + 1))
+        except Exception:
+            out = None
+        if out is not None:
+            if _tx in ('i', 'u', 'b') and _ty in ('i', 'u', 'b') \
+                    and _tz in ('i', 'u', 'b'):
+                out = out.astype('int64')  # 原路径 int 幂积为 Python int → int64
+            return out
     xv = _broadcast_flat(x, bshape)
     yv = _broadcast_flat(y, bshape)
     zv = _broadcast_flat(z, bshape)
@@ -805,6 +846,16 @@ def _polyvalnd(pts, c):
         raise ValueError("incompatible point dimensions in polyvalnd: "
                          + " ".join(repr(s) for s in shapes))
     bshape = _broadcast_shape(shapes)
+    # 数值：core 直连（Rust 内广播 + C 序系数 odometer，零系数跳过，
+    # 逐项累加顺序与纯 Python 实现一致 → 逐位可复现）
+    if str(getattr(c, '_dtype', ''))[:1] in ('f', 'i', 'u', 'b') and builtins.all(
+            str(getattr(p, '_dtype', ''))[:1] in ('f', 'i', 'u', 'b')
+            for p in pts):
+        try:
+            return _wrap(_core().polyvalnd_core(
+                c._array, [p._array for p in pts], list(bshape)))
+        except Exception:
+            pass  # 失败回退纯 Python 路径
     cvals = c.tolist()
     res = NX.zeros(bshape)
     for idx in _itertools.product(*[range(d) for d in c.shape]):

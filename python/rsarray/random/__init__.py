@@ -5,7 +5,8 @@ import rsarray.num_core as _core
 import random as _py_random
 import rsarray as np
 
-from ._distributions import Samplers, _POISSON_LAM_MAX, _broadcast_shapes, _zeta
+from ._distributions import (Samplers, _POISSON_LAM_MAX, _broadcast_shapes,
+                            _is_neg_zero)
 
 
 # _core.random.Generator may be Python's built-in typing.Generator, not a
@@ -172,10 +173,16 @@ def _sample_dist(sampler, name, params, size, int_dist=False):
         bn *= d
     fn = getattr(sampler, name)
     res = []
-    for i in range(total):
-        bidx = i % bn
-        vals = [d if k == 's' else d[bidx] for k, d in flat_params]
-        res.append(fn(*vals))
+    if all(k == 's' for k, d in flat_params):
+        # 标量参数快路径：常量参数提出循环
+        vals = [d for k, d in flat_params]
+        for _i in range(total):
+            res.append(fn(*vals))
+    else:
+        for i in range(total):
+            bidx = i % bn
+            vals = [d if k == 's' else d[bidx] for k, d in flat_params]
+            res.append(fn(*vals))
     if out_shape == ():
         return int(res[0]) if int_dist else res[0]
     return np.asarray(res, dtype='int64' if int_dist else 'float64').reshape(out_shape)
@@ -422,6 +429,16 @@ def _parse_int_dtype(name):
     return None
 
 
+def _shuffle_len(x):
+    """axis 0 有效长度（与 _python_shuffle 各分支的 n 判定一致）。"""
+    import rsarray.ma.core as _macore
+    if isinstance(x, list) or not hasattr(x, 'shape'):
+        return len(x)
+    if isinstance(x, _macore.MaskedArray):
+        return x.data.shape[0]
+    return x.shape[0]
+
+
 def _python_shuffle(next_j, x, axis=0, warn_1d_object=False):
     """Fisher-Yates 洗牌：list / ndarray（含 object/结构化/memoryview）。
 
@@ -498,7 +515,7 @@ class _MT19937Legacy:
     uniform = ``res53``（两个 32 位输出合成 53 位 double）；
     randint = ``rk_interval``（掩码拒绝采样，无偏）。
     """
-    __slots__ = ('_mt', '_mti', '_gauss_cache')
+    __slots__ = ('_mt', '_mti', '_gauss_cache', '_rs')
 
     def _init_state(self, seed):
         if seed is None:
@@ -515,6 +532,7 @@ class _MT19937Legacy:
         self._mt = mt
         self._mti = 624
         self._gauss_cache = None
+        self._sync_rs()
 
     def _init_by_array(self, key):
         """``mt19937_init_by_array``（legacy array 种子）。
@@ -551,12 +569,17 @@ class _MT19937Legacy:
         self._mt = mt
         self._mti = 624
         self._gauss_cache = None
+        self._sync_rs()
 
     def __init__(self, seed):
         self._init_state(seed)
 
     def reseed(self, seed):
         self._init_state(seed)
+
+    def _sync_rs(self):
+        """把流状态交给 Rust 核（播种留在 Python，已与标准逐位对照）。"""
+        self._rs = _core.random.Mt19937Stream(list(self._mt), self._mti)
 
     def _twist(self):
         mt = self._mt
@@ -569,30 +592,22 @@ class _MT19937Legacy:
         self._mti = 0
 
     def u32(self):
-        if self._mti >= 624:
-            self._twist()
-        x = self._mt[self._mti]
-        self._mti += 1
-        x ^= (x >> 11)
-        x ^= (x << 7) & 0x9d2c5680
-        x ^= (x << 15) & 0xefc60000
-        x ^= (x >> 18)
-        return x & 0xffffffff
+        return self._rs.u32()
 
     def random_sample(self):
-        a = self.u32() >> 5
-        b = self.u32() >> 6
-        return (a * 67108864.0 + b) * (1.0 / 9007199254740992.0)
+        return self._rs.random_sample()
+
+    def random_samples(self, n):
+        """批量 res53 流（单次 GIL 释放，与逐元素 random_sample 位兼容）。"""
+        return list(self._rs.random_samples(n))
 
     def interval(self, maxv):
         """``rk_interval(maxv)``：返回 [0, maxv] 的无偏整数。"""
-        if maxv == 0:
-            return 0
-        mask = (1 << maxv.bit_length()) - 1
-        while True:
-            v = self.u32() & mask
-            if v <= maxv:
-                return v
+        return self._rs.interval(maxv)
+
+    def intervals(self, rngs):
+        """批量 rk_interval（逐元素掩码拒绝，与逐元素 interval 位兼容）。"""
+        return list(self._rs.intervals(rngs))
 
     def _gen_mask(self, maxv):
         """``gen_mask``：最小位掩码 ≥ maxv（顶位以下全置 1）。"""
@@ -610,69 +625,17 @@ class _MT19937Legacy:
         random_buffered_bounded_uint8）：每 32-bit 字出 4 个 8-bit 值（LSB
         起）、掩码拒绝；单次 randint 调用内 buf 跨元素共享，跨调用全新
         （中为函数局部变量）。rngs: 逐元素闭包上界（hi-1-lo）。"""
-        buf = 0
-        bcnt = 0
-        out = []
-        for rng in rngs:
-            if rng == 0:
-                out.append(0)
-                continue
-            mask = self._gen_mask(rng)
-            while True:
-                if bcnt == 0:
-                    buf = self.u32()
-                    bcnt = 3
-                else:
-                    buf >>= 8
-                    bcnt -= 1
-                val = buf & 0xFF & mask
-                if val <= rng:
-                    break
-            out.append(val)
-        return out
+        return list(self._rs.intervals_u8(rngs))
 
     def intervals_u16(self, rngs):
         """legacy _rand_uint16 掩码路径：每 32-bit 字出 2 个 16-bit
         值（低半字先）、掩码拒绝；buf 语义同 intervals_u8。"""
-        buf = 0
-        bcnt = 0
-        out = []
-        for rng in rngs:
-            if rng == 0:
-                out.append(0)
-                continue
-            mask = self._gen_mask(rng)
-            while True:
-                if bcnt == 0:
-                    buf = self.u32()
-                    bcnt = 1
-                else:
-                    buf >>= 16
-                    bcnt -= 1
-                val = buf & 0xFFFF & mask
-                if val <= rng:
-                    break
-            out.append(val)
-        return out
+        return list(self._rs.intervals_u16(rngs))
 
     def intervals_bool(self, rngs):
         """legacy _rand_bool（buffered_bounded_bool）：每 32-bit 字出
         32 个 bit（LSB 起）、无拒绝；rng==0 元素不消耗随机数。"""
-        buf = 0
-        bcnt = 0
-        out = []
-        for rng in rngs:
-            if rng == 0:
-                out.append(0)
-                continue
-            if bcnt == 0:
-                buf = self.u32()
-                bcnt = 31
-            else:
-                buf >>= 1
-                bcnt -= 1
-            out.append(1 if (buf & 1) else 0)
-        return out
+        return list(self._rs.intervals_bool(rngs))
 
     def standard_normal(self):
         """legacy ``rk_gauss``（极坐标 Box-Muller，带缓存）。
@@ -680,20 +643,22 @@ class _MT19937Legacy:
         先返回 v2*r（第二个 res53 对应值），缓存 v1*r（第一个），
         与 逐位一致（小 size 与标量已验证；大 size 有 C/Python 位级差）。
         """
-        if self._gauss_cache is not None:
-            x = self._gauss_cache
-            self._gauss_cache = None
-            return x
-        import math
-        while True:
-            v1 = 2.0 * self.random_sample() - 1.0
-            v2 = 2.0 * self.random_sample() - 1.0
-            s = v1 * v1 + v2 * v2
-            if 0.0 < s < 1.0:
-                break
-        r = math.sqrt(-2.0 * math.log(s) / s)
-        self._gauss_cache = v1 * r
-        return v2 * r
+        return self._rs.standard_normals(1)[0]
+
+    def standard_normals(self, n):
+        """批量 rk_gauss（缓存存于 Rust 流状态，跨调用保留）。"""
+        return list(self._rs.standard_normals(n))
+
+    def _shuffle_next_j(self, x):
+        """Fisher-Yates j 序列：批量抽取 n-1..1（与逐元素 interval 位兼容），
+        按序消费。"""
+        js = self.intervals(list(range(_shuffle_len(x) - 1, 0, -1)))
+        it = iter(js)
+        return lambda i: next(it)
+
+    def bounded_integers(self, lo, rng, n, bits):
+        """标量 lo/hi bounded-integer 内核（Rust；返回最终值 f64 列表）。"""
+        return list(self._rs.bounded_integers(lo, rng, n, bits))
 
 
 class _PCG64LegacyStream(_MT19937Legacy):
@@ -715,12 +680,41 @@ class _PCG64LegacyStream(_MT19937Legacy):
         self._gauss_cache = None
 
     def u32(self):
-        return self._bg.next32()
+        return self._bg._rs.next32_one()
 
     def random_sample(self):
         # generic 位生成器：uint64_to_double(n) = (n >> 11) / 2^53
         # （取高 53 位，非 MT 的 res53 移位法）
-        return (self._bg.next64() >> 11) * (1.0 / 9007199254740992.0)
+        return self._bg._rs.random_sample()
+
+    def random_samples(self, n):
+        return list(self._bg._rs.random_samples(n))
+
+    def interval(self, maxv):
+        # random_interval：掩码拒绝 + uint32/64 流（与逐元素位兼容）
+        return self._bg._rs.intervals([maxv])[0]
+
+    def intervals(self, rngs):
+        return list(self._bg._rs.intervals(rngs))
+
+    def intervals_u8(self, rngs):
+        return list(self._bg._rs.intervals_u8(rngs))
+
+    def intervals_u16(self, rngs):
+        return list(self._bg._rs.intervals_u16(rngs))
+
+    def intervals_bool(self, rngs):
+        return list(self._bg._rs.intervals_bool(rngs))
+
+    def standard_normal(self):
+        return self._bg._rs.standard_normals(1)[0]
+
+    def standard_normals(self, n):
+        return list(self._bg._rs.standard_normals(n))
+
+    def bounded_integers(self, lo, rng, n, bits):
+        """标量 lo/hi bounded-integer 内核（Rust；返回最终值 f64 列表）。"""
+        return list(self._bg._rs.bounded_integers(lo, rng, n, bits))
 
     def reseed(self, seed):
         # —非 MT 位生成器上 RandomState.seed 委托 bit_generator.seed
@@ -780,7 +774,7 @@ class _RandomStateWrapper:
         total = 1
         for d in shape:
             total *= d
-        vals = [self._mt.random_sample() for _ in range(total)]
+        vals = self._mt.random_samples(total)
         return self._rs_f64(vals).reshape(shape)
 
     def random(self, *args, **kwargs):
@@ -854,7 +848,7 @@ class _RandomStateWrapper:
                 scale_f = scale_f * len(loc_f)
             if any(s < 0.0 for s in scale_f):
                 raise ValueError("scale < 0")
-            z = [self._next_normal() for _ in range(len(loc_f))]
+            z = self._mt.standard_normals(len(loc_f))
             vals = [loc_f[i] + scale_f[i] * z[i] for i in range(len(loc_f))]
             result = _np.asarray(vals, dtype='float64')
             if dtype is not None and hasattr(result, 'astype'):
@@ -864,7 +858,7 @@ class _RandomStateWrapper:
         # 标量路径
         loc = float(loc)
         scale = float(scale)
-        if scale < 0.0:
+        if scale < 0.0 or _is_neg_zero(scale):
             raise ValueError("scale < 0")
         if size is None:
             val = loc if scale == 0.0 else loc + scale * self._next_normal()
@@ -884,7 +878,8 @@ class _RandomStateWrapper:
             if scale == 0.0:
                 vals = [loc] * n
             else:
-                vals = [loc + scale * self._next_normal() for _ in range(n)]
+                z = self._mt.standard_normals(n)
+                vals = [loc + scale * v for v in z]
             result = _np.asarray(vals, dtype='float64')
             if len(shape) > 1:
                 result = result.reshape(shape)
@@ -897,7 +892,7 @@ class _RandomStateWrapper:
         dtype = kwargs.pop('dtype', None)
         return self.normal(0.0, 1.0, size=size, dtype=dtype)
 
-    def randn(self, *args):
+    def randn(self, *args):  # noqa: F811
         """标准正态分布 randn(d0, d1, ..., dn)（MT19937 Box-Muller）。"""
         return self.normal(0.0, 1.0, size=(args if args else None))
 
@@ -1006,12 +1001,11 @@ class _RandomStateWrapper:
                 if replace:
                     if p is not None:
                         cdf = _norm_cdf(pl)
-                        out = [_ss_right(cdf, self._next_u())
-                               for _ in range(nsize)]
+                        us = self._mt.random_samples(nsize)
+                        out = [_ss_right(cdf, u) for u in us]
                     else:
                         # randint(0, pop, size=shape)：rk_interval 掩码拒绝
-                        out = [self._mt.interval(pop - 1)
-                               for _ in range(nsize)]
+                        out = self._mt.intervals([pop - 1] * nsize)
                 else:
                     if nsize > pop:
                         raise ValueError(
@@ -1040,8 +1034,8 @@ class _RandomStateWrapper:
                     else:
                         # permutation(pop)[:nsize]：Fisher-Yates + interval
                         idx = list(range(pop))
-                        for i in range(pop - 1, 0, -1):
-                            j = self._mt.interval(i)
+                        js = self._mt.intervals(list(range(pop - 1, 0, -1)))
+                        for i, j in zip(range(pop - 1, 0, -1), js):
                             idx[i], idx[j] = idx[j], idx[i]
                         out = idx[:nsize]
 
@@ -1071,8 +1065,8 @@ class _RandomStateWrapper:
                 if isinstance(x, int):
                     n = x
                     idx = list(range(n))
-                    for i in range(n - 1, 0, -1):
-                        j = self._mt.interval(i)
+                    js = self._mt.intervals(list(range(n - 1, 0, -1)))
+                    for i, j in zip(range(n - 1, 0, -1), js):
                         idx[i], idx[j] = idx[j], idx[i]
                     if n == 0:
                         return np.zeros(0, dtype='int64')
@@ -1083,8 +1077,8 @@ class _RandomStateWrapper:
                         "x must be an integer or at least 1-dimensional")
                 n = arr.shape[0]
                 idx = list(range(n))
-                for i in range(n - 1, 0, -1):
-                    j = self._mt.interval(i)
+                js = self._mt.intervals(list(range(n - 1, 0, -1)))
+                for i, j in zip(range(n - 1, 0, -1), js):
                     idx[i], idx[j] = idx[j], idx[i]
                 if n == 0:
                     return np.empty(arr.shape, dtype=arr.dtype)
@@ -1096,12 +1090,12 @@ class _RandomStateWrapper:
                 if '_bg' in self.__dict__:
                     return self._bg.state
                 # legacy 布局: ('MT19937', keys[624], pos, has_gauss, cached)
-                mt = self._mt
-                keys = list(mt._mt)
-                pos = mt._mti
-                has_gauss = 1 if mt._gauss_cache is not None else 0
-                cached = mt._gauss_cache if mt._gauss_cache is not None else 0.0
-                return ('MT19937', keys, pos, has_gauss, cached)
+                # （状态单一事实源是 Rust 流；Python 属性仅兜底兼容）
+                keys, pos = self._mt._rs.state()
+                cached = self._mt._rs.gauss_cache()
+                has_gauss = 1 if cached is not None else 0
+                return ('MT19937', list(keys), pos, has_gauss,
+                        cached if cached is not None else 0.0)
             return get_state
         if name == 'set_state':
             def set_state(state):
@@ -1113,16 +1107,15 @@ class _RandomStateWrapper:
                 # 兼容 3 元素旧格式（无 has_gauss/cached）。
                 keys = [int(k) & 0xffffffff for k in state[1]]
                 pos = int(state[2])
+                cache = float(state[4]) if len(state) >= 5 and state[3] else None
+                self._mt._rs.set_state(keys, pos, cache)
                 self._mt._mt = keys
                 self._mt._mti = pos
-                if len(state) >= 5 and state[3]:
-                    self._mt._gauss_cache = float(state[4])
-                else:
-                    self._mt._gauss_cache = None
+                self._mt._gauss_cache = cache
             return set_state
         if name == 'standard_normal':
             def standard_normal(size=None):
-                return self._inner.randn(*( (size,) if isinstance(size, int)
+                return self._inner.randn(*((size,) if isinstance(size, int)
                                             else tuple(size) if size else (1,)))
             return standard_normal
         if name == 'multinomial':
@@ -1179,7 +1172,55 @@ class _RandomStateWrapper:
     # 纯 Python 补齐的 legacy 方法（统计正确；逐位兼容流需 MT19937 内核）
     # ------------------------------------------------------------------
     def _sample_dist(self, name, params, size, int_dist=False):
+        if not int_dist and name in ('uniform', 'normal'):
+            fast = self._scalar_fast(name, params)
+            if fast is not None:
+                return fast(size)
         return _sample_dist(self._sampler, name, params, size, int_dist)
+
+    def _scalar_fast(self, name, params):
+        """标量参数快路径：批量流 + 向量化变换（与 Samplers 逐元素变换
+        位兼容）；不满足条件返回 None（走通用路径）。"""
+        if any(_is_arraylike(p) for p in params):
+            return None
+        import math
+        if name == 'uniform':
+            low, high = float(params[0]), float(params[1])
+            if not (low < high):
+                raise ValueError("high <= low")
+            if not math.isfinite(high - low):
+                raise OverflowError("uniform range overflows float64")
+
+            def fast(size):
+                ssize = _norm_size(size)
+                total = 1
+                for d in ssize:
+                    total *= d
+                us = self._mt.random_samples(total)
+                vals = [low + (high - low) * u for u in us]
+                if ssize == ():
+                    return vals[0]
+                return np.asarray(vals, dtype='float64').reshape(ssize)
+            return fast
+        loc, scale = float(params[0]), float(params[1])
+        if scale < 0.0 or (
+                scale == 0.0 and math.copysign(1.0, scale) < 0.0):
+            raise ValueError("scale < 0")
+
+        def fast(size):
+            ssize = _norm_size(size)
+            total = 1
+            for d in ssize:
+                total *= d
+            if scale == 0.0:
+                vals = [float(loc)] * total
+            else:
+                z = self._mt.standard_normals(total)
+                vals = [loc + scale * v for v in z]
+            if ssize == ():
+                return vals[0]
+            return np.asarray(vals, dtype='float64').reshape(ssize)
+        return fast
 
     def _multinomial_impl(self, n, pvals, size):
         return _multinomial_impl(self._sampler, n, pvals, size)
@@ -1282,6 +1323,7 @@ class _RandomStateWrapper:
         # 0-d 标量（rsarray 标量 / 0-d 数组）走 int() 取精确值：asarray 路径
         # 在 f64 2^63 边界丢精度（int64.max → 2^63 → tolist 环绕成 -2^63），
         # 而 int() 对标量返回精确值。无 ndim 属性的 list 等仍走 asarray 路径。
+
         def _is_scalar0(x):
             return _is_arraylike(x) and getattr(x, 'ndim', None) == 0
         lo_arr = _is_arraylike(low) and not _is_scalar0(low)
@@ -1323,16 +1365,22 @@ class _RandomStateWrapper:
         # （均 LSB 起 + 掩码拒绝），u32/u64=1 字/值（interval，无偏拒绝）。
         # 同宽度 signed 与 unsigned 流相同（仅二补体重解释）；单次调用内
         # buf 跨元素共享、跨调用全新。
-        rngs = [his[i % bn] - 1 - los[i % bn] for i in range(total)]
-        if is_bool:
-            uint_vals = self._mt.intervals_bool(rngs)
-        elif bits == 8:
-            uint_vals = self._mt.intervals_u8(rngs)
-        elif bits == 16:
-            uint_vals = self._mt.intervals_u16(rngs)
+        if bn == 1 and total > 1 and not is_bool:
+            # 标量 lo/hi：整个内核在 Rust 完成（f64 返回，避免 2N 元素 int
+            # 经 Python 往返；与逐元素路径逐位一致）
+            vals = self._mt.bounded_integers(
+                los[0], his[0] - 1 - los[0], total, bits)
         else:
-            uint_vals = [self._mt.interval(r) for r in rngs]
-        vals = [los[i % bn] + v for i, v in enumerate(uint_vals)]
+            rngs = [his[i % bn] - 1 - los[i % bn] for i in range(total)]
+            if is_bool:
+                uint_vals = self._mt.intervals_bool(rngs)
+            elif bits == 8:
+                uint_vals = self._mt.intervals_u8(rngs)
+            elif bits == 16:
+                uint_vals = self._mt.intervals_u16(rngs)
+            else:
+                uint_vals = [self._mt.interval(r) for r in rngs]
+            vals = [los[i % bn] + v for i, v in enumerate(uint_vals)]
         if total == 1 and ssize == () and bshape == ():
             v = vals[0]
             # 显式 Python 类型 → 返回 Python 标量（无 .dtype）
@@ -1377,8 +1425,8 @@ class _RandomStateWrapper:
         # 的原生（小端）字节串截断——直接取 u32 流，非 res53 缩放。
         n = int(length)
         n_uint32 = (n - 1) // 4 + 1
-        return b''.join(self._mt.interval(0xffffffff).to_bytes(4, 'little')
-                        for _ in range(n_uint32))[:n]
+        vals32 = self._mt.intervals([0xffffffff] * n_uint32)
+        return b''.join(v.to_bytes(4, 'little') for v in vals32)[:n]
 
     def tomaxint(self, type='int32'):
         import re
@@ -1389,7 +1437,7 @@ class _RandomStateWrapper:
     def shuffle(self, x, axis=0):
         if axis != 0 and hasattr(x, 'shape'):
             x = np.moveaxis(x, axis, 0)
-        _python_shuffle(lambda i: self._mt.interval(i), x, 0,
+        _python_shuffle(self._mt._shuffle_next_j(x), x, 0,
                         warn_1d_object=True)
 
     def seed(self, s=None):
@@ -1562,35 +1610,16 @@ class _WrappedGenerator:
         if axis != 0 and hasattr(x, 'shape'):
             x = np.moveaxis(x, axis, 0)
         if self._pcg is not None:
-            bg = self._pcg
+            # random_interval（distributions.c）：掩码拒绝 + uint32/64 流，
+            # 批量抽取 j 序列（与逐元素位兼容）
+            _python_shuffle(self._pcg._shuffle_next_j(x), x, 0)
+            return
 
-            def next_j(i):
-                # random_interval（distributions.c）：掩码拒绝 + uint32 流
-                if i == 0:
-                    return 0
-                mask = i
-                mask |= mask >> 1
-                mask |= mask >> 2
-                mask |= mask >> 4
-                mask |= mask >> 8
-                mask |= mask >> 16
-                mask |= mask >> 32
-                if i <= 0xffffffff:
-                    while True:
-                        v = bg.next32() & mask
-                        if v <= i:
-                            return v
-                else:
-                    while True:
-                        v = bg.next64() & mask
-                        if v <= i:
-                            return v
-        else:
-            def next_j(i):
-                v = self._inner.integers(0, i + 1)
-                if hasattr(v, 'item'):
-                    v = v.item()
-                return int(v)
+        def next_j(i):
+            v = self._inner.integers(0, i + 1)
+            if hasattr(v, 'item'):
+                v = v.item()
+            return int(v)
         _python_shuffle(next_j, x, 0)
 
     def _make_choice(self):
@@ -2019,6 +2048,10 @@ class PCG64:
         self._step()
         self._has_uint32 = 0
         self._uinteger = 0
+        # 流生成移交 Rust 核（播种留在 Python，已逐位对照标准）；
+        # 状态单一事实源是 _rs
+        self._rs = _core.random.Pcg64Stream(
+            self._state, self._inc, self._has_uint32, self._uinteger)
         return self
 
     def _step(self):
@@ -2026,30 +2059,20 @@ class PCG64:
 
     def next64(self):
         """一个 64 位输出（先步进后输出，XSL-RR）。"""
-        self._step()
-        hi = self._state >> 64
-        lo = self._state & self._MASK64
-        x = hi ^ lo
-        rot = (self._state >> 122) & 63
-        return ((x >> rot) | (x << ((-rot) & 63))) & self._MASK64
+        return self._rs.next64_one()
 
     def next32(self):
         """32 位输出，带 uinteger 缓存（对应 state 的 has_uint32 字段）。"""
-        if self._has_uint32:
-            self._has_uint32 = 0
-            return self._uinteger
-        n = self.next64()
-        self._has_uint32 = 1
-        self._uinteger = n >> 32
-        return n & 0xFFFFFFFF
+        return self._rs.next32_one()
 
     @property
     def state(self):
         """``PCG64.state`` get：dict（state/inc 为 128-bit 整数）。"""
+        s, inc, h32, ue = self._rs.state()
         return {'bit_generator': 'PCG64',
-                'state': {'state': self._state, 'inc': self._inc},
-                'has_uint32': self._has_uint32,
-                'uinteger': self._uinteger}
+                'state': {'state': s, 'inc': inc},
+                'has_uint32': h32,
+                'uinteger': ue}
 
     @state.setter
     def state(self, value):
@@ -2057,10 +2080,16 @@ class PCG64:
             raise TypeError('state must be a dict')
         if value.get('bit_generator', '') != 'PCG64':
             raise ValueError('state must be for a PCG64 RNG')
-        self._state = int(value['state']['state']) & self._MASK128
-        self._inc = int(value['state']['inc']) & self._MASK128
-        self._has_uint32 = int(value['has_uint32'])
-        self._uinteger = int(value['uinteger']) & 0xFFFFFFFF
+        self._rs.set_state(
+            int(value['state']['state']) & self._MASK128,
+            int(value['state']['inc']) & self._MASK128,
+            int(value['has_uint32']),
+            int(value['uinteger']) & 0xFFFFFFFF)
+
+    def _shuffle_next_j(self, x):
+        js = self._rs.intervals(list(range(_shuffle_len(x) - 1, 0, -1)))
+        it = iter(js)
+        return lambda i: next(it)
 
     def __repr__(self):
         return f'PCG64(seed={self._seed_seq.entropy!r})'
@@ -2197,15 +2226,19 @@ BitGenerator = _default_rng.BitGenerator
 mtrand = _default_rng.mtrand
 default_rng = _default_rng.default_rng
 
+
 def rand(*args):
     # MT19937 全局流（与 randint/uniform 共用 _get_legacy_state）
     return _get_legacy_state().rand(*args)
 
+
 randn = _default_rng.randn
+
 
 def random(*args, **kwargs):
     # legacy random_sample：MT19937 全局流
     return _get_legacy_state().random(*args, **kwargs)
+
 
 random_sample = random
 randn_like = _default_rng.randn_like

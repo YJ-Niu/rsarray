@@ -188,21 +188,91 @@ fn logical_xor(x1: &NdArray, x2: &NdArray) -> PyResult<NdArray> {
     })
 }
 
+/// 逐元素 isclose（数组语义）：|a-b| <= atol + rtol*|b|；相等值（含 inf==inf /
+/// -inf==-inf）恒 close；NaN 对仅 equal_nan 时 True；非有限非相等对恒 False。
+/// 复数取模，实/虚部分别判有限。
+/// 支持通用 N 维广播（ndarray 零拷贝广播视图）。
+/// 注：pyo3 0.30 的 signature 宏对 `=false` 布尔默认值会静默丢弃参数，
+/// 统一用 Option<bool> + None 默认值
 #[pyfunction]
-#[pyo3(signature = (a, b, rtol=1e-05, atol=1e-08))]
-fn isclose(a: &NdArray, b: &NdArray, rtol: f64, atol: f64) -> PyResult<NdArray> {
-    let tol_atol = atol;
-    let tol_rtol = rtol;
-    let result = broadcast_binary_op(&a.data, &b.data, move |x, y| {
-        if (x - y).abs() <= tol_atol + tol_rtol * y.abs() {
-            1.0
-        } else {
-            0.0
-        }
-    })?;
+#[pyo3(signature = (a, b, rtol=1e-05, atol=1e-08, equal_nan=None))]
+fn isclose(
+    a: &NdArray,
+    b: &NdArray,
+    rtol: f64,
+    atol: f64,
+    equal_nan: Option<bool>,
+) -> PyResult<NdArray> {
+    let equal_nan = equal_nan.unwrap_or(false);
+    let out_shape =
+        broadcast_shape(a.data.shape(), b.data.shape()).map_err(PyValueError::new_err)?;
+    // broadcast 返回零拷贝视图；物化为 owned 以复用 `&owned` Zip part 惯例
+    // （ndarray 0.17 中 `&视图` 不是合法的 Zip part）
+    let ar = a
+        .data
+        .broadcast(IxDyn(&out_shape))
+        .ok_or_else(|| PyValueError::new_err("broadcast shape mismatch"))?
+        .to_owned();
+    let br = b
+        .data
+        .broadcast(IxDyn(&out_shape))
+        .ok_or_else(|| PyValueError::new_err("broadcast shape mismatch"))?
+        .to_owned();
+    let is_complex = a.imag.is_some() || b.imag.is_some();
+    let mut out = Array::zeros(IxDyn(&out_shape));
+    if is_complex {
+        let ai = match &a.imag {
+            Some(im) => im
+                .broadcast(IxDyn(&out_shape))
+                .ok_or_else(|| PyValueError::new_err("broadcast shape mismatch"))?
+                .to_owned(),
+            None => Array::zeros(ar.dim().clone()),
+        };
+        let bi = match &b.imag {
+            Some(im) => im
+                .broadcast(IxDyn(&out_shape))
+                .ok_or_else(|| PyValueError::new_err("broadcast shape mismatch"))?
+                .to_owned(),
+            None => Array::zeros(br.dim().clone()),
+        };
+        Zip::from(&mut out)
+            .and(&ar)
+            .and(&br)
+            .and(&ai)
+            .and(&bi)
+            .for_each(|o: &mut f64, x, y, xi, yi| {
+                let a_nan = x.is_nan() || xi.is_nan();
+                let b_nan = y.is_nan() || yi.is_nan();
+                *o = if a_nan && b_nan {
+                    f64::from(equal_nan)
+                } else if x == y && xi == yi {
+                    1.0
+                } else if x.is_finite() && xi.is_finite() && y.is_finite() && yi.is_finite() {
+                    let d_re = x - y;
+                    let d_im = xi - yi;
+                    let dist = (d_re * d_re + d_im * d_im).sqrt();
+                    let mag_b = (y * y + yi * yi).sqrt();
+                    f64::from(dist <= atol + rtol * mag_b)
+                } else {
+                    0.0
+                };
+            });
+    } else {
+        Zip::from(&mut out).and(&ar).and(&br).for_each(|o, x, y| {
+            *o = if x.is_nan() && y.is_nan() {
+                f64::from(equal_nan)
+            } else if x == y {
+                1.0
+            } else if x.is_finite() && y.is_finite() {
+                f64::from((x - y).abs() <= atol + rtol * y.abs())
+            } else {
+                0.0
+            };
+        });
+    }
     Ok(NdArray {
         imag: None,
-        data: result,
+        data: out,
     })
 }
 

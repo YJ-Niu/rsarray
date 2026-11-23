@@ -1739,13 +1739,14 @@ impl NdArray {
         match axis {
             None => {
                 if let Some(im) = &self.imag {
-                    // 复数求和：实部、虚部分别累加
+                    // 复数求和：实部、虚部分别累加。
+                    // 用 iter() 逻辑序遍历：IxDyn 数组的 usize 索引是首维
+                    // 索引，多维数组会越界 panic
                     let re = &self.data;
-                    let n = re.len();
                     let (mut sr, mut si) = (0.0_f64, 0.0_f64);
-                    for i in 0..n {
-                        sr += re[i];
-                        si += im[i];
+                    for (r, w) in re.iter().zip(im.iter()) {
+                        sr += r;
+                        si += w;
                     }
                     let shape = if keepdims {
                         vec![1usize; self.data.ndim()]
@@ -1775,6 +1776,25 @@ impl NdArray {
                 } else {
                     ax as usize
                 };
+                if let Some(im) = &self.imag {
+                    // 复数轴归约：实部/虚部分别归约，结果保持 complex
+                    let re = self.data.sum_axis(Axis(ax));
+                    let img = im.sum_axis(Axis(ax));
+                    let shape = if keepdims {
+                        let mut s = self.data.shape().to_vec();
+                        s[ax] = 1;
+                        s
+                    } else {
+                        re.shape().to_vec()
+                    };
+                    let re_arr = re
+                        .into_shape_with_order(IxDyn(&shape))
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    let im_arr = img
+                        .into_shape_with_order(IxDyn(&shape))
+                        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    return Ok(NdArray::from_complex(re_arr, im_arr));
+                }
                 let result = self.data.sum_axis(Axis(ax));
                 let shape = if keepdims {
                     let mut s = self.data.shape().to_vec();
@@ -1798,6 +1818,19 @@ impl NdArray {
     fn mean(&self, axis: Option<isize>, keepdims: bool) -> PyResult<NdArray> {
         match axis {
             None => {
+                if let Some(im) = &self.imag {
+                    // 复数均值：实部/虚部分别平均（空数组为 0）
+                    let val = self.data.mean().unwrap_or(0.0);
+                    let img = im.mean().unwrap_or(0.0);
+                    let shape = if keepdims {
+                        vec![1usize; self.data.ndim()]
+                    } else {
+                        vec![]
+                    };
+                    let data = Array::from_elem(IxDyn(&shape), val);
+                    let imag = Array::from_elem(IxDyn(&shape), img);
+                    return Ok(NdArray::from_complex(data, imag));
+                }
                 let val = self.data.mean().unwrap_or(0.0);
                 let shape = if keepdims {
                     vec![1usize; self.data.ndim()]
@@ -1819,6 +1852,26 @@ impl NdArray {
                 let result = self.data.mean_axis(Axis(ax));
                 match result {
                     Some(mean_arr) => {
+                        if let Some(im) = &self.imag {
+                            // 复数轴均值：实部/虚部分别归约，结果保持 complex
+                            let im_mean = im
+                                .mean_axis(Axis(ax))
+                                .ok_or_else(|| PyValueError::new_err("Invalid axis"))?;
+                            let shape = if keepdims {
+                                let mut s = self.data.shape().to_vec();
+                                s[ax] = 1;
+                                s
+                            } else {
+                                mean_arr.shape().to_vec()
+                            };
+                            let arr = mean_arr
+                                .into_shape_with_order(IxDyn(&shape))
+                                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                            let im_arr = im_mean
+                                .into_shape_with_order(IxDyn(&shape))
+                                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                            return Ok(NdArray::from_complex(arr, im_arr));
+                        }
                         let shape = if keepdims {
                             let mut s = self.data.shape().to_vec();
                             s[ax] = 1;

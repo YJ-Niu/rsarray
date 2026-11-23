@@ -133,7 +133,7 @@ def _ufunc_resolve_dtypes(self, dtypes, *, signature=None, casting=None,
     nargs = self.nargs
     if len(dtypes) != nargs:
         raise TypeError(
-            f"resolve_dtypes: The dtypes must be a tuple of `ufunc.nargs` length.")
+                "resolve_dtypes: The dtypes must be a tuple of `ufunc.nargs` length.")
     nin = self.nin
     loop_types = getattr(self, 'types', None) or []
     loops = [t.split('->') for t in loop_types]
@@ -269,7 +269,7 @@ _sys.modules['rsarray'] = _current_module
 _sys.modules['rsarray.__init__'] = _current_module
 _current_module.__name__ = 'rsarray'
 
-__version__ = "1.2.10"
+__version__ = "1.2.11"
 
 # 捕获内建函数别名：_extra 挂载会向本模块 globals 注入同名的 rsarray 函数
 # （all/any/round），会遮蔽内建函数。以下别名保证本文件内部逻辑始终使用内建实现。
@@ -1633,7 +1633,7 @@ class ndarray:
         # 委托给 Rust getitem_multi 处理所有索引逻辑
         result = np.getitem_multi(self._array, key, list(self.shape))
         result = _wrap_result(result, self._dtype)
-        # Track strided slices so flags.c_contiguous reports False like 
+        # Track strided slices so flags.c_contiguous reports False like
         _ks_s = key if isinstance(key, tuple) else (key,)
         if _is_ndarray(result) and _py_any(
                 isinstance(k, slice) and k.step not in (None, 1) for k in _ks_s):
@@ -2251,6 +2251,7 @@ class ndarray:
             # 与 np.power 的 _c_pow_c99 保持一致，test_umath_complex 依赖）。
             try:
                 from .math_functions import _c_pow_c99 as _cpow99
+
                 def _fc_p(x):
                     if isinstance(x, list):
                         out = []
@@ -2288,6 +2289,7 @@ class ndarray:
             # 复数 rpow：Python 级 C99 复数幂（同 __pow__，绕开 bpo-44698）
             try:
                 from .math_functions import _c_pow_c99 as _cpow99
+
                 def _fc_p(x):
                     if isinstance(x, list):
                         out = []
@@ -3216,6 +3218,11 @@ class ndarray:
     def choose(self, choices, out=None, mode='raise'):
         """按 self 的元素值从 choices 中逐元素选取（ndarray.choose 兼容）。"""
         c_list = list(choices)
+        # 各 choice 的扁平值只算一次（原先循环内逐元素 tolist → O(n²)）
+        c_flat = [
+            _flatten_vals(c.tolist()) if hasattr(c, '_array') else None
+            for c in c_list
+        ]
         try:
             idx = [int(v) for v in self._array.flatten().tolist()]
         except Exception:
@@ -3230,12 +3237,11 @@ class ndarray:
                 k = builtins.max(0, builtins.min(k, len(c_list) - 1))
             else:
                 k %= len(c_list)
-            c = c_list[k]
-            if hasattr(c, '_array'):
-                cf = _flatten_vals(c.tolist())
-                out_vals.append(cf[i] if i < len(cf) else (cf[0] if cf else 0))
+            cf = c_flat[k]
+            if cf is None:
+                out_vals.append(c_list[k])
             else:
-                out_vals.append(c)
+                out_vals.append(cf[i] if i < len(cf) else (cf[0] if cf else 0))
         if self.size == 1 and not self.shape:
             res = array(out_vals[0])
         else:
@@ -3859,10 +3865,17 @@ def _matmul_fallback(a, b):
         return zeros(bs + (a_shape[-2], b_shape[-1]), dtype=a._dtype)
 
     if len(a_shape) == 3 and len(b_shape) == 3:
-        batch_size = a_shape[0]
+        # 批维广播兜底（Rust 主路径已支持广播；此处服务非连续输入）：
+        # 1 可广播，其余须相等，否则按数组语义报错（与 numpy 一致）。
+        ba, bb = a_shape[0], b_shape[0]
+        if ba != bb and ba != 1 and bb != 1:
+            raise ValueError(
+                f"shapes {a_shape} and {b_shape} not aligned: "
+                f"batch dim {ba} vs {bb} not broadcastable")
+        batch_size = max(ba, bb)
         result = empty((batch_size, a_shape[1], b_shape[2]), dtype=a._dtype)
         for i in range(batch_size):
-            result[i] = a[i] @ b[i]
+            result[i] = a[i % ba] @ b[i % bb]
         return result
 
     if len(a_shape) == 3 and len(b_shape) == 2:
@@ -8188,6 +8201,7 @@ class matrix(ndarray):
             s = data.strip()
             if s.startswith('[') and s.endswith(']'):
                 s = s[1:-1]
+                
             def _parse_elem(e):
                 if e in ('True', 'true'):
                     return True
@@ -8275,7 +8289,7 @@ class matrix(ndarray):
                 n = len(index)
             except Exception:
                 n = 0
-            if n > 1 and isscalar(index[1]):
+            if n > 1 and isinstance(index[1], int):
                 out = out.reshape((sh, 1))
             else:
                 out = out.reshape((1, sh))
@@ -8327,7 +8341,7 @@ class matrix(ndarray):
         return self.A.ravel()
 
     @property
-    def I(self):
+    def I(self):  # noqa
         """返回可逆 self 的（乘法）逆矩阵；非方阵用伪逆。"""
         m, n = self.shape
         import rsarray.linalg as _la
@@ -10510,7 +10524,7 @@ def _grid_range_to_1d(r):
         return ndarray(r)
 
 
-def _reshape_flat(flat, shape):
+def _reshape_flat(flat, shape):  # noqa
     """把 1-D 值列表按 C 序折成给定 shape 的嵌套列表。"""
     if len(shape) == 1:
         return flat
@@ -10546,10 +10560,12 @@ class _MGridTop:
     """np.mgrid：可调用且可下标（数组语义 mgrid[a:b, c:d] == mgrid(a:b, c:d)）。"""
     def __call__(self, *ranges):
         return _mgrid_impl(*ranges)
+
     def __getitem__(self, item):
         if not isinstance(item, tuple):
             item = (item,)
         return self(*item)
+
     def __repr__(self):
         return "mgrid"
 
@@ -10578,10 +10594,12 @@ class _OGGridTop:
     """np.ogrid：可调用且可下标（数组语义）。"""
     def __call__(self, *ranges):
         return _ogrid_impl(*ranges)
+
     def __getitem__(self, item):
         if not isinstance(item, tuple):
             item = (item,)
         return self(*item)
+
     def __repr__(self):
         return "ogrid"
 
@@ -10594,56 +10612,41 @@ def meshgrid(*xi, copy=True, sparse=False, indexing='xy'):
 
     默认使用 'xy' 索引（与 rsarray 一致），返回一维输入数组两两组合的网格。
     """
-    arrays = []
-    for x in xi:
-        if hasattr(x, 'tolist'):
-            arrays.append([int(v) for v in x.tolist()])
-        elif isinstance(x, (list, tuple)):
-            arrays.append([int(v) for v in x])
-        else:
-            arrays.append([int(x)])
-
-    n = len(arrays)
+    indexing = str(indexing)
+    if indexing not in ('xy', 'ij'):
+        raise ValueError(f"unexpected indexing value {indexing!r}")
+    n = len(xi)
     if n == 0:
         return []
-
+    arrs = [asarray(x) for x in xi]
+    # 数值输入：core 直连（零 Python 浮点往返，无嵌套列表构造）
+    # 注意：本模块 all 被 rsarray 数组函数遮蔽，必须用 builtins 版本
+    if builtins.all(str(getattr(a, '_dtype', ''))[:1] in ('f', 'i', 'u', 'b') for a in arrs):
+        outs = np.meshgrid_core(
+            [a._array for a in arrs], 0 if indexing == 'xy' else 1, sparse)
+        return [ndarray._wrap(o) for o in outs]
+    # 非数值输入（字符串等）：列表路径（复数经 float() 自然报错，与旧实现一致）
+    arrays = []
+    for a in arrs:
+        arrays.append([float(v) for v in a.tolist()])
     shapes = [len(a) for a in arrays]
+    # 输出维置换：xy（n>=2）交换前两维，ij 恒等
+    if indexing == 'xy' and n >= 2:
+        perm = [1, 0] + list(range(2, n))
+    else:
+        perm = list(range(n))
+    out_shape = tuple(shapes[k] for k in perm)
 
     if sparse:
         result = []
         for i in range(n):
-            if i == 0:
-                grid = ndarray([[arrays[i][j]] for j in range(shapes[i])])
-            else:
-                grid = ndarray([arrays[i]])
-            result.append(grid)
+            shp = [1] * n
+            shp[perm.index(i)] = shapes[i]
+            result.append(ndarray(_reshape_flat(arrays[i], shp)))
         return result
 
-    result = []
-
-    for i in range(n):
-        if indexing == 'xy' and n == 2:
-            if i == 0:
-                grid = ndarray([[arrays[0][k] for k in range(shapes[0])] for _ in range(shapes[1])])
-            else:
-                grid = ndarray([[arrays[1][j] for _ in range(shapes[0])] for j in range(shapes[1])])
-        elif indexing == 'ij':
-            if n == 2:
-                if i == 0:
-                    grid = ndarray([[arrays[0][j] for _ in range(shapes[1])] for j in range(shapes[0])])
-                else:
-                    grid = ndarray([[arrays[1][k] for k in range(shapes[1])] for _ in range(shapes[0])])
-            elif n == 3:
-                grid = ndarray([[[arrays[i][j] if i == 0 else (arrays[i][k] if i == 1 else arrays[i][l_])
-                                 for l_ in range(shapes[2])]
-                                for k in range(shapes[1])]
-                               for j in range(shapes[0])])
-            else:
-                grid = ndarray([[arrays[i][j] for _ in range(shapes[1])] for j in range(shapes[0])])
-        else:
-            grid = ndarray([[arrays[i][j] for _ in range(shapes[1])] for j in range(shapes[0])])
-        result.append(grid)
-    return result
+    flat, _shape = np.meshgrid(arrays, 0 if indexing == 'xy' else 1)
+    return [ndarray(_reshape_flat(f, out_shape)) for f in flat]
 
 
 # ========== FFT ==========
@@ -10965,6 +10968,7 @@ class _DTypeNamespace:
     Float64DType = type('Float64DType', (), {'_dt_name': 'float64'})
     Complex64DType = type('Complex64DType', (), {'_dt_name': 'complex64'})
     Complex128DType = type('Complex128DType', (), {'_dt_name': 'complex128'})
+    
     def _str_dtype_init(self, *a, **k):
         # StringDType(na_object)：保存 NA 对象（None/nan/str/任意对象）
         _na = k.get('na_object', a[0] if a else None)
