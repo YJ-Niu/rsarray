@@ -3216,6 +3216,11 @@ class ndarray:
     def choose(self, choices, out=None, mode='raise'):
         """按 self 的元素值从 choices 中逐元素选取（ndarray.choose 兼容）。"""
         c_list = list(choices)
+        # 各 choice 的扁平值只算一次（原先循环内逐元素 tolist → O(n²)）
+        c_flat = [
+            _flatten_vals(c.tolist()) if hasattr(c, '_array') else None
+            for c in c_list
+        ]
         try:
             idx = [int(v) for v in self._array.flatten().tolist()]
         except Exception:
@@ -3230,12 +3235,11 @@ class ndarray:
                 k = builtins.max(0, builtins.min(k, len(c_list) - 1))
             else:
                 k %= len(c_list)
-            c = c_list[k]
-            if hasattr(c, '_array'):
-                cf = _flatten_vals(c.tolist())
-                out_vals.append(cf[i] if i < len(cf) else (cf[0] if cf else 0))
+            cf = c_flat[k]
+            if cf is None:
+                out_vals.append(c_list[k])
             else:
-                out_vals.append(c)
+                out_vals.append(cf[i] if i < len(cf) else (cf[0] if cf else 0))
         if self.size == 1 and not self.shape:
             res = array(out_vals[0])
         else:
@@ -3859,10 +3863,17 @@ def _matmul_fallback(a, b):
         return zeros(bs + (a_shape[-2], b_shape[-1]), dtype=a._dtype)
 
     if len(a_shape) == 3 and len(b_shape) == 3:
-        batch_size = a_shape[0]
+        # 批维广播兜底（Rust 主路径已支持广播；此处服务非连续输入）：
+        # 1 可广播，其余须相等，否则按数组语义报错（与 numpy 一致）。
+        ba, bb = a_shape[0], b_shape[0]
+        if ba != bb and ba != 1 and bb != 1:
+            raise ValueError(
+                f"shapes {a_shape} and {b_shape} not aligned: "
+                f"batch dim {ba} vs {bb} not broadcastable")
+        batch_size = max(ba, bb)
         result = empty((batch_size, a_shape[1], b_shape[2]), dtype=a._dtype)
         for i in range(batch_size):
-            result[i] = a[i] @ b[i]
+            result[i] = a[i % ba] @ b[i % bb]
         return result
 
     if len(a_shape) == 3 and len(b_shape) == 2:
