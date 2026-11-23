@@ -34,7 +34,12 @@ def _ensure(x):
 
 
 def _round_float(v):
-    """对浮点数进行四舍五入，避免出现 .999999999999999 等精度问题。"""
+    """对浮点数进行四舍五入，避免出现 .999999999999999 等精度问题。
+
+    complex 无 __round__，直接放行（复数不做近整取整）。
+    """
+    if isinstance(v, complex):
+        return v
     if abs(v - round(v)) < 1e-10:
         return round(v)
     return v
@@ -926,8 +931,8 @@ class linalg_module:
         if n == 0:
             return _as_result(ndarray([]).astype(res_dt).reshape(shape))
         if len(shape) == 2:
-            # Rust 快路径仅 2x2/3x3 实输入；1x1/大尺寸/复数走纯 Python
-            # 高斯-约当（列主元）。
+            # Rust 快路径仅 2x2/3x3 实输入；1x1/大尺寸/复数走 core
+            # gj_solve（任意尺寸、复数），纯 Python 高斯-约当兜底。
             if not _is_complex_arr(a_arr) and n in (2, 3):
                 try:
                     return _as_result(
@@ -935,10 +940,27 @@ class linalg_module:
                             res_dt))
                 except ValueError:
                     pass
-            return _as_result(
-                ndarray(_gauss_jordan_inv(a_arr.tolist())).astype(res_dt))
+            try:
+                return _as_result(_wrap(
+                    _core.linalg.gj_solve_core(a_arr._array, None))
+                    .astype(res_dt))
+            except ValueError:
+                # 奇异（或核心异常）→ 纯 Python 高斯-约当
+                # （奇异时同样抛 LinAlgError）
+                return _as_result(
+                    ndarray(_gauss_jordan_inv(a_arr.tolist())).astype(
+                        res_dt))
         lead, subs = _stacked_2d(a_arr)
-        out = [_gauss_jordan_inv(sub.tolist()) for sub in subs]
+        out = []
+        for sub in subs:
+            try:
+                out.append(_wrap(
+                    _core.linalg.gj_solve_core(sub._array, None)).tolist())
+            except ValueError:
+                # 核心异常（通常奇异）→ 整体回退纯 Python
+                return _as_result(ndarray(
+                    [_gauss_jordan_inv(s.tolist()) for s in subs]
+                ).astype(res_dt).reshape(shape))
         return _as_result(ndarray(out).astype(res_dt).reshape(shape))
 
     @staticmethod
@@ -1166,6 +1188,13 @@ class linalg_module:
                         _ensure(A), _ensure(B))).tolist()
                 except ValueError:
                     pass
+            # core gj（任意尺寸、复数）；奇异 → ValueError，
+            # 落到纯 Python（奇异同样走 pinv 兜底）
+            try:
+                return _wrap(_core.linalg.gj_solve_core(
+                    _ensure(A), _ensure(B))).tolist()
+            except ValueError:
+                pass
             b_rows = B.tolist()
             if b1d:
                 b_rows = [[v] for v in b_rows]

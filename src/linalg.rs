@@ -1938,6 +1938,144 @@ fn solve_banded(lower: usize, upper: usize, ab: &NdArray, b: &NdArray) -> PyResu
     solve(&full_nd, b)
 }
 
+/// 复数幅值（hypot，与 Python abs(complex) 一致）
+#[inline]
+fn gj_mag(z: (f64, f64)) -> f64 {
+    z.0.hypot(z.1)
+}
+
+/// 复数除法（朴素公式 (ac+bd)/m + (bc-ad)/m，m = c²+d²）
+#[inline]
+fn gj_cdiv(x: (f64, f64), y: (f64, f64)) -> (f64, f64) {
+    let m = y.0 * y.0 + y.1 * y.1;
+    ((x.0 * y.0 + x.1 * y.1) / m, (x.1 * y.0 - x.0 * y.1) / m)
+}
+
+/// a - f*w（f*w 先乘后减，运算次序与 Python complex 一致）
+#[inline]
+fn gj_csub_mul(a: (f64, f64), f: (f64, f64), w: (f64, f64)) -> (f64, f64) {
+    (a.0 - (f.0 * w.0 - f.1 * w.1), a.1 - (f.0 * w.1 + f.1 * w.0))
+}
+
+/// 高斯-约当消元核心：解 Ax=b（列主元，任意 n、k 个右端）。
+/// b=None → 右端为单位阵（即矩阵求逆）。语义与 Python
+/// _gauss_jordan_solve/_gauss_jordan_inv 对齐：eps = n * max|A| * 2.22e-16
+/// （max|A|==0 → 1e-10，且 max|A| 只统计 A）；主元为严格大于扫描
+/// （并列取最先，NaN 不会胜过既有最优）；奇异 → Err("Singular matrix")；
+/// 消元跳过 factor==0 的行。元素统一 (re, im) 对，实数输入 im=0。
+#[pyfunction]
+#[pyo3(signature = (a, b=None))]
+fn gj_solve_core(a: &NdArray, b: Option<&NdArray>) -> PyResult<NdArray> {
+    let a_shape: Vec<usize> = a.data.shape().to_vec();
+    if a_shape.len() != 2 || a_shape[0] != a_shape[1] {
+        return Err(PyValueError::new_err(
+            "gj_solve_core: a must be square (n, n)",
+        ));
+    }
+    let n = a_shape[0];
+    let k = match &b {
+        None => n,
+        Some(b) => match b.data.shape().to_vec().as_slice() {
+            [m] if *m == n => 1,
+            [m, kk] if *m == n => *kk,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "gj_solve_core: b must be (n,) or (n, k)",
+                ));
+            }
+        },
+    };
+    let complex = a.imag.is_some() || b.is_some_and(|x| x.imag.is_some());
+    // 读入（逻辑 C 序展平，任意布局安全）
+    let mut work: Vec<(f64, f64)> = a.data.iter().map(|&r| (r, 0.0)).collect();
+    if let Some(im) = &a.imag {
+        for (w, &i) in work.iter_mut().zip(im.iter()) {
+            w.1 = i;
+        }
+    }
+    let mut rhs: Vec<(f64, f64)>;
+    if let Some(b) = b {
+        rhs = b.data.iter().map(|&r| (r, 0.0)).collect();
+        if let Some(im) = &b.imag {
+            for (w, &i) in rhs.iter_mut().zip(im.iter()) {
+                w.1 = i;
+            }
+        }
+    } else {
+        rhs = (0..n * n)
+            .map(|p| {
+                let (i, j) = (p / n, p % n);
+                (if i == j { 1.0 } else { 0.0 }, 0.0)
+            })
+            .collect();
+    }
+    let max_abs = work.iter().map(|z| gj_mag(*z)).fold(0.0f64, f64::max);
+    let eps = if max_abs != 0.0 {
+        n as f64 * max_abs * 2.220446049250313e-16
+    } else {
+        1e-10
+    };
+    for col in 0..n {
+        let mut pivot = col;
+        let mut best = gj_mag(work[col * n + col]);
+        for r in (col + 1)..n {
+            let v = gj_mag(work[r * n + col]);
+            if v > best {
+                best = v;
+                pivot = r;
+            }
+        }
+        if best < eps {
+            return Err(PyValueError::new_err("Singular matrix"));
+        }
+        if pivot != col {
+            for j in 0..n {
+                work.swap(col * n + j, pivot * n + j);
+            }
+            for j in 0..k {
+                rhs.swap(col * k + j, pivot * k + j);
+            }
+        }
+        let pv = work[col * n + col];
+        for j in 0..n {
+            work[col * n + j] = gj_cdiv(work[col * n + j], pv);
+        }
+        for j in 0..k {
+            rhs[col * k + j] = gj_cdiv(rhs[col * k + j], pv);
+        }
+        for r in 0..n {
+            if r == col {
+                continue;
+            }
+            let factor = work[r * n + col];
+            if factor.0 == 0.0 && factor.1 == 0.0 {
+                continue;
+            }
+            for j in 0..n {
+                let w = work[col * n + j];
+                work[r * n + j] = gj_csub_mul(work[r * n + j], factor, w);
+            }
+            for j in 0..k {
+                let w = rhs[col * k + j];
+                rhs[r * k + j] = gj_csub_mul(rhs[r * k + j], factor, w);
+            }
+        }
+    }
+    let out_real: Vec<f64> = rhs.iter().map(|z| z.0).collect();
+    let data = Array::from_shape_vec(IxDyn(&[n, k]), out_real)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let imag = if complex {
+        let v: Vec<f64> = rhs.iter().map(|z| z.1).collect();
+        Some(
+            Array::from_shape_vec(IxDyn(&[n, k]), v)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    Ok(NdArray { data, imag })
+}
+
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dot, m)?)?;
     m.add_function(wrap_pyfunction!(vdot, m)?)?;
@@ -1959,5 +2097,6 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(svdvals, m)?)?;
     m.add_function(wrap_pyfunction!(eigh, m)?)?;
     m.add_function(wrap_pyfunction!(solve_banded, m)?)?;
+    m.add_function(wrap_pyfunction!(gj_solve_core, m)?)?;
     Ok(())
 }
