@@ -654,60 +654,11 @@ class NdArrayMethods:
         _ = dtype, out
         # 0-d 短路：Rust 归约对 0-d 输入会 abort；返回保持原 dtype 的 0-d
         if not tuple(getattr(arr._array, 'shape', ())):
-            nd = _nd()
-            return nd(arr._array, _dtype=getattr(arr, '_dtype', 'float64'))
-        # complex 短路：Rust 归约对 complex 会 abort，纯 Python 求和
-        _k = getattr(getattr(arr, '_dtype_obj', None), 'kind', None)
-        if _k is None:
-            _dn = str(getattr(arr, '_dtype', ''))
-            _k = _dn[0] if _dn else '?'
-        if _k == 'c':
-            axis = NdArrayMethods._reduce_axis_check(arr, axis)
-            _vals = arr.tolist()
-
-            def _cs(x):
-                if isinstance(x, (list, tuple)):
-                    return _cs(x[0]) + sum(_cs(y) for y in x[1:])
-                return x
-
-            if axis is None:
-                return _cs(_vals)
-            # axis 归约：展平为 (lead × size_ax × trail)，对每个 (lead, trail)
-            # 位置求和，结果形状为去掉 axis 维（keepdims 时置 1）
-            shape = arr.shape
-            size_ax = shape[axis]
-            lead = 1
-            for d in shape[:axis]:
-                lead *= d
-            trail = 1
-            for d in shape[axis + 1:]:
-                trail *= d
-
-            def _flat(x):
-                out = []
-                for w in (x if isinstance(x, (list, tuple)) else [x]):
-                    if isinstance(w, (list, tuple)):
-                        out.extend(_flat(w))
-                    else:
-                        out.append(w)
-                return out
-
-            _flatv = _flat(_vals)
-            res_flat = []
-            for li in range(lead):
-                for ti in range(trail):
-                    s = 0j
-                    for ai in range(size_ax):
-                        s += _flatv[(li * size_ax + ai) * trail + ti]
-                    res_flat.append(s)
-            out_shape = list(shape[:axis]) + list(shape[axis + 1:])
-            if keepdims:
-                out_shape = list(shape[:axis]) + [1] + list(shape[axis + 1:])
-            nd = _nd()
-            if not res_flat:
-                return nd([]).reshape(tuple(out_shape))
-            return nd(res_flat).reshape(tuple(out_shape)).astype(
-                getattr(arr, '_dtype', 'complex128'))
+            ndarray_cls, _ = _get_deps()
+            return ndarray_cls(
+                arr._array, _dtype=getattr(arr, '_dtype', 'float64'))
+        # 复数走 Rust 实/虚双通道归约（axis=None / 指定 axis 均支持），
+        # 不再用纯 Python tolist + 三重循环
         axis = NdArrayMethods._reduce_axis_check(arr, axis)
         try:
             result = arr._array.sum(axis, keepdims)
@@ -768,7 +719,10 @@ class NdArrayMethods:
             return res
         if axis is None and not keepdims and hasattr(result, 'tolist'):
             return result.tolist()
-        return _wrap_result(result)
+        # 复数结果保持 complex128 标签；其余保持 Rust f64 存储语义
+        _src_dt = str(getattr(arr, '_dtype', ''))
+        return _wrap_result(
+            result, 'complex128' if _src_dt.startswith('complex') else 'float64')
 
     @staticmethod
     def prod(arr, axis=None, dtype=None, out=None, keepdims=False):
@@ -776,8 +730,9 @@ class NdArrayMethods:
         _ = dtype, out
         # 0-d 短路：Rust 归约对 0-d 输入会 abort；返回保持原 dtype 的 0-d
         if not tuple(getattr(arr._array, 'shape', ())):
-            nd = _nd()
-            return nd(arr._array, _dtype=getattr(arr, '_dtype', 'float64'))
+            ndarray_cls, _ = _get_deps()
+            return ndarray_cls(
+                arr._array, _dtype=getattr(arr, '_dtype', 'float64'))
         axis = NdArrayMethods._reduce_axis_check(arr, axis)
         result = arr._array.prod(axis, keepdims)
         if axis is None and not keepdims and hasattr(result, 'tolist'):
