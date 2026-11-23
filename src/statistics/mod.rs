@@ -1610,6 +1610,85 @@ fn nancumprod(x: &NdArray, axis: Option<isize>) -> PyResult<NdArray> {
     }
 }
 
+/// N 维直方图分箱（core 直连）：cols 为每维值列表（同长），
+/// edges 为每维边界（单调非减），weights 可选（同长，否则每样本 1.0）。
+/// 输出 C 序 flat（长度 Π nbins，首维 bin 最快）。bin 语义与 numpy 一致：
+/// - 末 bin 闭区间（v == edges[-1] 计入末 bin）
+/// - 越界 / NaN 样本不计
+/// H 规模溢出 → ValueError("too many bins")。
+#[pyfunction]
+fn histdd_core(
+    cols: Vec<Vec<f64>>,
+    edges: Vec<Vec<f64>>,
+    weights: Option<Vec<f64>>,
+) -> PyResult<Vec<f64>> {
+    let d = cols.len();
+    if d == 0 || edges.len() != d {
+        return Err(PyValueError::new_err("hist: cols/edges mismatch"));
+    }
+    let n = cols[0].len();
+    for c in cols.iter() {
+        if c.len() != n {
+            return Err(PyValueError::new_err("hist: cols must have equal lengths"));
+        }
+    }
+    if weights.as_ref().is_some_and(|w| w.len() != n) {
+        return Err(PyValueError::new_err("hist: weights length mismatch"));
+    }
+    let nbins: Vec<usize> = edges.iter().map(|e| e.len() - 1).collect();
+    let mut size: usize = 1;
+    for &nb in nbins.iter() {
+        size = size
+            .checked_mul(nb)
+            .ok_or_else(|| PyValueError::new_err("too many bins"))?;
+    }
+    let mut strides = vec![1usize; d];
+    for i in (1..d).rev() {
+        strides[i - 1] = strides[i] * nbins[i];
+    }
+    let mut h = vec![0.0f64; size];
+    for s in 0..n {
+        let wv = match weights.as_ref() {
+            Some(w) => w[s],
+            None => 1.0,
+        };
+        let mut flat = 0usize;
+        let mut ok = true;
+        for i in 0..d {
+            let v = cols[i][s];
+            if v.is_nan() {
+                ok = false;
+                break;
+            }
+            let e = &edges[i];
+            // bisect_right（普通比较，v 非 NaN）
+            let mut lo = 0usize;
+            let mut hi = e.len();
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if v < e[mid] {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            let mut bi = lo as i64 - 1;
+            if bi == nbins[i] as i64 && v == e[nbins[i]] {
+                bi -= 1; // 末 bin 闭区间
+            }
+            if bi < 0 || v < e[0] || v > e[nbins[i]] {
+                ok = false;
+                break;
+            }
+            flat += (bi as usize) * strides[i];
+        }
+        if ok {
+            h[flat] += wv;
+        }
+    }
+    Ok(h)
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(sum, m)?)?;
     m.add_function(wrap_pyfunction!(prod, m)?)?;
@@ -1650,5 +1729,6 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(nanargmin_axis, m)?)?;
     m.add_function(wrap_pyfunction!(nancumsum, m)?)?;
     m.add_function(wrap_pyfunction!(nancumprod, m)?)?;
+    m.add_function(wrap_pyfunction!(histdd_core, m)?)?;
     Ok(())
 }

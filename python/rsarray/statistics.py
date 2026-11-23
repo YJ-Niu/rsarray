@@ -1091,14 +1091,18 @@ def histogram(a, bins=10, range=None, weights=None, density=None):
     nb = len(edges) - 1
     w_float = w is not None and not _hist_is_int_dtype(
         (weights if hasattr(weights, '_array') else _rs.array(weights)).dtype)
-    counts = [0.0] * nb if w_float else [0] * nb
-    for i in _builtins.range(n):
-        v = vals[i]
-        b = bisect.bisect_right(edges, v) - 1
-        if b == nb and v == edges[-1]:
-            b = nb - 1
-        if 0 <= b < nb:
-            counts[b] += (w[i] if w is not None else 1)
+    # 分箱：core 直连（Rust 逐元素二分，NaN/越界不计）；失败回退纯 Python
+    try:
+        counts = _core.histdd_core([vals], [edges], w)
+    except Exception:
+        counts = [0.0] * nb if w_float else [0] * nb
+        for i in _builtins.range(n):
+            v = vals[i]
+            b = bisect.bisect_right(edges, v) - 1
+            if b == nb and v == edges[-1]:
+                b = nb - 1
+            if 0 <= b < nb:
+                counts[b] += (w[i] if w is not None else 1)
     if density:
         # —n / db / n.sum()，n 是入界计数(含 outlier 会失真)
         total = _builtins.sum(_builtins.float(c) for c in counts)
@@ -1225,16 +1229,22 @@ def histogram2d(x, y, bins=_H2D_DEFAULT, range=_H2D_DEFAULT,
     yed = _hist2d_edges(by_spec, ya, rng_y)
     nbx = len(xed) - 1
     nby = len(yed) - 1
-    count = [[0.0] * nby for _ in _builtins.range(nbx)]
-    for i in _builtins.range(N):
-        bx = bisect.bisect_right(xed, xa[i]) - 1
-        if bx == nbx and xa[i] == xed[-1]:
-            bx = nbx - 1
-        by = bisect.bisect_right(yed, ya[i]) - 1
-        if by == nby and ya[i] == yed[-1]:
-            by = nby - 1
-        if 0 <= bx < nbx and 0 <= by < nby:
-            count[bx][by] += w[i]
+    # 分箱：core 直连（Rust 逐样本双维二分）；失败回退纯 Python
+    try:
+        flat = _core.histdd_core([xa, ya], [xed, yed], w)
+        count = [[flat[i * nby + j] for j in _builtins.range(nby)]
+                 for i in _builtins.range(nbx)]
+    except Exception:
+        count = [[0.0] * nby for _ in _builtins.range(nbx)]
+        for i in _builtins.range(N):
+            bx = bisect.bisect_right(xed, xa[i]) - 1
+            if bx == nbx and xa[i] == xed[-1]:
+                bx = nbx - 1
+            by = bisect.bisect_right(yed, ya[i]) - 1
+            if by == nby and ya[i] == yed[-1]:
+                by = nby - 1
+            if 0 <= bx < nbx and 0 <= by < nby:
+                count[bx][by] += w[i]
     if density:
         total = _builtins.sum(w)
         if total > 0:
@@ -1308,34 +1318,41 @@ def histogramdd(sample, bins=10, range=None, density=False, weights=None):
     size = 1
     for n in nbins:
         size *= n
-    # bin 总数过大（如 10 维 bins=2**10 → 2**100）→ 数组语义抛 ValueError
+    # 分箱：core 直连（Rust 逐样本逐维二分，NaN/越界不计）
+    # bin 总数过大 → Rust 抛 ValueError("too many bins")，直接透传
     try:
-        H = [0.0] * size
-    except OverflowError:
-        raise ValueError("too many bins")
-    strides = [1] * d
-    for i in _range(d - 2, -1, -1):
-        strides[i] = strides[i + 1] * nbins[i + 1]
-    n_samples = len(cols[0])
-    for s in _range(n_samples):
-        idx = []
-        ok = True
-        for i in _range(d):
-            v = cols[i][s]
-            e = edges[i]
-            bi = bisect.bisect_right(e, v) - 1
-            if bi == len(e) - 1 and v == e[-1]:
-                bi -= 1  # 末 bin 闭区间
-            if bi < 0 or v < e[0] or v > e[-1]:
-                ok = False
-                break
-            idx.append(bi)
-        if not ok:
-            continue
-        flat = 0
-        for i in _range(d):
-            flat += idx[i] * strides[i]
-        H[flat] += w[s] if w is not None else 1.0
+        H = _core.histdd_core(cols, edges, w)
+    except ValueError:
+        raise
+    except Exception:
+        # 回退纯 Python（含 size 过大时 [0.0]*size 的 OverflowError → ValueError）
+        try:
+            H = [0.0] * size
+        except OverflowError:
+            raise ValueError("too many bins")
+        strides = [1] * d
+        for i in _range(d - 2, -1, -1):
+            strides[i] = strides[i + 1] * nbins[i + 1]
+        n_samples = len(cols[0])
+        for s in _range(n_samples):
+            idx = []
+            ok = True
+            for i in _range(d):
+                v = cols[i][s]
+                e = edges[i]
+                bi = bisect.bisect_right(e, v) - 1
+                if bi == len(e) - 1 and v == e[-1]:
+                    bi -= 1  # 末 bin 闭区间
+                if bi < 0 or v < e[0] or v > e[-1]:
+                    ok = False
+                    break
+                idx.append(bi)
+            if not ok:
+                continue
+            flat = 0
+            for i in _range(d):
+                flat += idx[i] * strides[i]
+            H[flat] += w[s] if w is not None else 1.0
     if density:
         total = sum(H)
         widths = [[edges[i][j + 1] - edges[i][j]
