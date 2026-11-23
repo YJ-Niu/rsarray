@@ -166,6 +166,154 @@ fn unpackbits(a: &NdArray, count: Option<usize>, bitorder: &str) -> NdArray {
     }
 }
 
+/// 比特展开（core 直连）：a 为数值数组（任意布局，按逻辑 C 序读取），
+/// bitorder 为 big/little。
+/// axis=None → 展平后 1-D 展开（长度 8*size）；
+/// axis=Some(ax) → 位轴（长度 n）替换原 ax 轴，其他维保持原始顺序不变。
+/// count：正数 → 截断/零填充到该长度；负数 → total + count（< 0 抛 ValueError）；
+/// None → 全展开长度。
+#[pyfunction]
+#[pyo3(signature = (a, axis=None, count=None, bitorder="big"))]
+fn unpackbits_core(
+    a: &NdArray,
+    axis: Option<usize>,
+    count: Option<isize>,
+    bitorder: &str,
+) -> PyResult<NdArray> {
+    if a.imag.is_some() {
+        return Err(PyTypeError::new_err(
+            "unpackbits complex not supported in core path",
+        ));
+    }
+    let big = match bitorder {
+        "big" => true,
+        "little" => false,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "bitorder must be 'big' or 'little', got {other:?}"
+            )));
+        }
+    };
+    let nd = a.data.ndim();
+    let expand_byte = |v: u8| -> [u8; 8] {
+        let mut b = [0u8; 8];
+        for (j, bit) in b.iter_mut().enumerate() {
+            *bit = if big {
+                (v >> (7 - j)) & 1
+            } else {
+                (v >> j) & 1
+            };
+        }
+        b
+    };
+    let make_out = |shape: Vec<usize>, flat: Vec<u8>| {
+        let result: Vec<f64> = flat.iter().map(|&v| v as f64).collect();
+        let arr = Array::from_shape_vec(IxDyn(&shape), result)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(NdArray {
+            imag: None,
+            data: arr,
+        })
+    };
+    match axis {
+        None => {
+            let vals: Vec<u8> = a.data.iter().map(|&v| v as u8).collect();
+            let total = 8 * vals.len();
+            let n_i = match count {
+                Some(c) if c >= 0 => c,
+                Some(c) => total as isize + c,
+                None => total as isize,
+            };
+            if n_i < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid count {} for unpacking {} bits",
+                    count.unwrap_or(0),
+                    total
+                )));
+            }
+            let n = n_i as usize;
+            let mut out = vec![0u8; n];
+            for (i, &v) in vals.iter().enumerate() {
+                let b = expand_byte(v);
+                for (j, &bv) in b.iter().enumerate() {
+                    let pos = i * 8 + j;
+                    if pos < n {
+                        out[pos] = bv;
+                    }
+                }
+            }
+            make_out(vec![n], out)
+        }
+        Some(ax) => {
+            if ax >= nd {
+                return Err(PyValueError::new_err("axis out of bounds for unpackbits"));
+            }
+            let ashp: Vec<usize> = a.data.shape().to_vec();
+            let other: Vec<usize> = (0..nd).filter(|&i| i != ax).collect();
+            let other_shape: Vec<usize> = other.iter().map(|&i| ashp[i]).collect();
+            let n_other: usize = other_shape.iter().product();
+            let k = ashp[ax];
+            let total = 8 * k;
+            let n_i = match count {
+                Some(c) if c >= 0 => c,
+                Some(c) => total as isize + c,
+                None => total as isize,
+            };
+            if n_i < 0 {
+                return Err(PyValueError::new_err(format!(
+                    "Invalid count {} for unpacking {} bits",
+                    count.unwrap_or(0),
+                    total
+                )));
+            }
+            let n = n_i as usize;
+            // 源按逻辑 C 序展平（任意布局安全）
+            let sv: Vec<f64> = a.data.iter().copied().collect();
+            let mut strides = vec![1usize; nd];
+            for i in (1..nd).rev() {
+                strides[i - 1] = strides[i] * ashp[i];
+            }
+            let other_strides: Vec<usize> = other.iter().map(|&i| strides[i]).collect();
+            let outsize = n * n_other;
+            let mut out = vec![0u8; outsize];
+            for r in 0..n_other {
+                let mut rem = r;
+                let mut base = 0usize;
+                for j in (0..other.len()).rev() {
+                    let d = rem % other_shape[j];
+                    rem /= other_shape[j];
+                    base += d * other_strides[j];
+                }
+                for av in 0..k {
+                    let v = sv[base + av * strides[ax]] as u8;
+                    let b = expand_byte(v);
+                    for (bit, &bv) in b.iter().enumerate() {
+                        // 全位索引 = av*8 + bit（漏 av*8 会让同 r 各字节互相覆盖）
+                        let pos = (av * 8 + bit) * n_other + r;
+                        if pos < outsize {
+                            out[pos] = bv;
+                        }
+                    }
+                }
+            }
+            // (n, *other) 布局 → 最终形状（位轴放回 ax 位置，其他轴原始顺序）：
+            // r = pre_c * post_prod + post_c；flat_f = (pre_c * n + bit) * post_prod + post_c
+            let post_prod: usize = (ax + 1..nd).map(|i| ashp[i]).product();
+            let mut final_out = vec![0u8; outsize];
+            for r in 0..n_other {
+                let pre = r / post_prod;
+                let post = r % post_prod;
+                for bit in 0..n {
+                    final_out[(pre * n + bit) * post_prod + post] = out[bit * n_other + r];
+                }
+            }
+            let mut final_shape = ashp;
+            final_shape[ax] = n;
+            make_out(final_shape, final_out)
+        }
+    }
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(invert, m)?)?;
     m.add_function(wrap_pyfunction!(bitwise_and, m)?)?;
@@ -177,6 +325,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(binary_repr, m)?)?;
     m.add_function(wrap_pyfunction!(packbits, m)?)?;
     m.add_function(wrap_pyfunction!(unpackbits, m)?)?;
+    m.add_function(wrap_pyfunction!(unpackbits_core, m)?)?;
     m.add_function(wrap_pyfunction!(bitwise_count, m)?)?;
     Ok(())
 }

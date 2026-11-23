@@ -3111,6 +3111,18 @@ def unpackbits(a, axis=None, count=None, bitorder='big'):
         if isinstance(bitorder, str):
             raise ValueError("bitorder must be 'big' or 'little'")
         raise TypeError("bitorder must be 'big' or 'little'")
+    # 整型（非复数/非字符串/非 float）：core 直连（Rust 单遍展开 + count
+    # + axis 布局，零 list 往返）；float 保持原路径（uint8 舍入语义不同）
+    if str(getattr(arr, '_dtype', ''))[:1] in ('i', 'u', 'b') \
+            and getattr(arr, '_str_dtype', None) is None \
+            and getattr(arr, '_array', None) is not None:
+        try:
+            ax = None if axis is None else (int(axis) % nd if nd else 0)
+            ct = None if count is None else int(count)
+            res = _core.unpackbits_core(arr._array, ax, ct, bitorder)
+            return _wrap(res, _dtype='uint8')
+        except Exception:
+            pass  # 回退原路径
     if axis is None or nd <= 1:
         moved = arr.reshape((-1,))
         k = int(moved.size)

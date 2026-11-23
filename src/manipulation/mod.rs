@@ -851,21 +851,69 @@ fn rot90(a: &NdArray, k: isize, axis1: usize, axis2: usize) -> PyResult<NdArray>
 #[pyfunction]
 fn broadcast_to(a: &NdArray, shape: &Bound<'_, PyAny>) -> PyResult<NdArray> {
     let s = shape_to_vec(shape)?;
-    let broadcast = a
-        .data
-        .broadcast(IxDyn(&s))
-        .ok_or_else(|| {
-            PyValueError::new_err(format!(
-                "Cannot broadcast shape {:?} to {:?}",
-                a.data.shape(),
-                s
-            ))
-        })?
-        .to_owned();
+    let err = || {
+        PyValueError::new_err(format!(
+            "Cannot broadcast shape {:?} to {:?}",
+            a.data.shape(),
+            s
+        ))
+    };
+    let broadcast = a.data.broadcast(IxDyn(&s)).ok_or_else(err)?.to_owned();
+    // 复数：虚部通道同步广播（纯增强，imag=None 时行为不变）
+    let imag = match &a.imag {
+        Some(im) => Some(im.broadcast(IxDyn(&s)).ok_or_else(err)?.to_owned()),
+        None => None,
+    };
     Ok(NdArray {
-        imag: None,
+        imag,
         data: broadcast,
     })
+}
+
+/// 平铺重复（单次拷贝）：out[idx] = a[各维 idx % shape[i]]。
+/// reps 须与 a.ndim 等长（Python 侧补 1 / 前导补新轴后传入）；
+/// r=0 → 输出含 0 维空轴；复数 → TypeError（Python 侧回退）。
+#[pyfunction]
+fn tile_core(a: &NdArray, reps: Vec<usize>) -> PyResult<NdArray> {
+    if a.imag.is_some() {
+        return Err(PyTypeError::new_err(
+            "tile complex not supported in core path",
+        ));
+    }
+    let nd = a.data.ndim();
+    if nd == 0 || reps.len() != nd {
+        return Err(PyValueError::new_err("tile: reps must match array ndim"));
+    }
+    let ashp: Vec<usize> = a.data.shape().to_vec();
+    let outsh: Vec<usize> = reps.iter().zip(&ashp).map(|(&r, &s)| r * s).collect();
+    let outsize: usize = outsh.iter().product();
+    if outsize == 0 {
+        let data = Array::from_shape_vec(IxDyn(&outsh), vec![])
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        return Ok(NdArray { imag: None, data });
+    }
+    // 源按逻辑 C 序展平（任意布局安全）
+    let av: Vec<f64> = a.data.iter().copied().collect();
+    // 源 C 序 strides（stride 累积与循环顺序无关）
+    let mut a_strides = vec![1usize; nd];
+    for i in (1..nd).rev() {
+        a_strides[i - 1] = a_strides[i] * ashp[i];
+    }
+    let mut out = vec![0.0f64; outsize];
+    for (of, slot) in out.iter_mut().enumerate() {
+        // 输出 C 序多指标分解（末维最快）+ 源索引 stride 累积
+        let mut rem = of;
+        let mut af = 0usize;
+        for i in (0..nd).rev() {
+            let di = rem % outsh[i];
+            rem /= outsh[i];
+            af += (di % ashp[i]) * a_strides[i];
+        }
+        *slot = av[af];
+    }
+    let data = Array::from_shape_vec(IxDyn(&outsh), out)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray { imag: None, data })
 }
 
 // ========== 翻转数组 ==========
@@ -1771,6 +1819,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(reshape, m)?)?;
     m.add_function(wrap_pyfunction!(expand_dims, m)?)?;
     m.add_function(wrap_pyfunction!(broadcast_to, m)?)?;
+    m.add_function(wrap_pyfunction!(tile_core, m)?)?;
     m.add_function(wrap_pyfunction!(roll, m)?)?;
     m.add_function(wrap_pyfunction!(rot90, m)?)?;
     m.add_function(wrap_pyfunction!(flip, m)?)?;

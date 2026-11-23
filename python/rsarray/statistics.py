@@ -1062,13 +1062,106 @@ def _rs_dtype_of(a):
     return (a if hasattr(a, '_array') else _rs.array(a)).dtype
 
 
-def histogram(a, bins=10, range=None, weights=None, density=None):
-    """计算直方图（纯 Python：int/边界数组/字符串 bins、range、density、weights）。"""
-    import bisect
+def _hist_finalize(counts, edges, w_float, density):
+    """直方图收尾：density 归一 / dtype 定型 / edges 返回（与原 Python 尾部逐位一致）。"""
+    import rsarray as _rs
+    if density:
+        nb = len(edges) - 1
+        total = _builtins.sum(_builtins.float(c) for c in counts)
+        if total > 0:
+            counts = [_builtins.float(counts[i]) / (total * (edges[i + 1] - edges[i]))
+                      for i in _builtins.range(nb)]
+        else:
+            counts = [0.0] * nb
+        return _rs.array(counts, dtype='float64'), _rs.array(edges, dtype='float64')
+    if w_float:
+        counts_arr = _rs.array([_builtins.float(c) for c in counts], dtype='float64')
+    else:
+        counts_arr = _rs.array([_builtins.int(c) for c in counts], dtype='int64')
+    return counts_arr, _rs.array(edges, dtype='float64')
+
+
+def _hist_edges_core(a_flat, bins, rng):
+    """core 快路径边界计算：int bins（含/不含 range）/ 显式 edges。
+    min/max 走 Rust（忽略 NaN，与 builtins.min/max 在常见输入下一致）；
+    校验与 _hist_get_bin_edges / _hist_outer_edges 保持一致。"""
     import math
+    import rsarray as _rs
+    if isinstance(bins, (int, float)) and not isinstance(bins, bool):
+        if isinstance(bins, float):
+            raise TypeError('`bins` must be an integer, a string, or an array')
+        n_equal = bins
+        if n_equal < 1:
+            raise ValueError('`bins` must be positive, when an integer')
+        if rng is not None:
+            fe, le = _builtins.float(rng[0]), _builtins.float(rng[1])
+            if fe > le:
+                raise ValueError('max must be larger than min in range parameter.')
+            if not (math.isfinite(fe) and math.isfinite(le)):
+                raise ValueError(
+                    f"supplied range of [{fe}, {le}] is not finite")
+        elif a_flat.size == 0:
+            fe, le = 0.0, 1.0
+        else:
+            fe = _builtins.float(_core.min(a_flat._array).tolist())
+            le = _builtins.float(_core.max(a_flat._array).tolist())
+            if not (math.isfinite(fe) and math.isfinite(le)):
+                raise ValueError(
+                    f"autodetected range of [{fe}, {le}] is not finite")
+        if fe == le:
+            fe, le = fe - 0.5, le + 0.5
+        edges = [fe + (le - fe) * i / n_equal
+                 for i in _builtins.range(n_equal + 1)]
+        edges[-1] = le
+        for i in _builtins.range(len(edges) - 1):
+            if edges[i] >= edges[i + 1]:
+                raise ValueError(
+                    f'Too many bins for data range. Cannot create '
+                    f'{n_equal} finite-sized bins.')
+        return edges
+    b_arr = bins if hasattr(bins, '_array') else _rs.array(bins)
+    if b_arr.ndim > 1:
+        raise ValueError('`bins` must be 1d, when an array')
+    edges = [_builtins.float(e) for e in _rs_flat(bins)]
+    for i in _builtins.range(len(edges) - 1):
+        if edges[i] > edges[i + 1]:
+            raise ValueError(
+                '`bins` must increase monotonically, when an array')
+    return edges
+
+
+def _hist2d_edges_core(spec, a_flat, rng):
+    """histogram2d 快路径边界：int bins（min/max 走 Rust）/ 显式 edges。
+    与 _hist2d_edges 逐式一致（末边缘不做 hi 回写）。"""
+    import rsarray as _rs
+    if isinstance(spec, (int, float)) and not isinstance(spec, bool):
+        nb = _builtins.int(spec)
+        if nb <= 0:
+            raise ValueError("bins must be positive")
+        if rng is not None:
+            lo, hi = _builtins.float(rng[0]), _builtins.float(rng[1])
+        elif a_flat.size == 0:
+            lo, hi = 0.0, 1.0
+        else:
+            lo = _builtins.float(_core.min(a_flat._array).tolist())
+            hi = _builtins.float(_core.max(a_flat._array).tolist())
+            if lo == hi:
+                lo, hi = lo - 0.5, hi + 0.5
+        step = (hi - lo) / nb
+        e = [lo + step * i for i in _builtins.range(nb + 1)]
+        e[-1] = hi  # 末边缘回写（与 1-D/dd 一致，避免浮点截断丢最大样本）
+        return e
+    if hasattr(spec, '_array'):
+        return [_builtins.float(e) for e in spec.reshape((-1,)).tolist()]
+    return [_builtins.float(e) for e in _rs.array(spec).reshape((-1,)).tolist()]
+
+
+def histogram(a, bins=10, range=None, weights=None, density=None):
+    """计算直方图（int/边界数组/字符串 bins、range、density、weights；
+    分箱已下放 Rust histdd_core 内核，零 Python 往返）。"""
+    import bisect
     import warnings
     import rsarray as _rs
-    _ = density is None  # density 默认 None，等价 False
     if density is None:
         density = False
     a_arr = a if hasattr(a, '_array') else _rs.array(a)
@@ -1076,6 +1169,26 @@ def histogram(a, bins=10, range=None, weights=None, density=None):
         warnings.warn(
             f"Converting input from {a_arr.dtype} to bool for compatibility.",
             RuntimeWarning)
+    if range is not None and len(range) != 2:
+        raise ValueError('range must be a sequence of two numbers')
+    # core 快路径：int bins / 显式 edges（边界计算不需要 vals 的 Python 列表，
+    # 分箱直接读 core）；字符串估计器须整份 vals → 保持原路径
+    if not isinstance(bins, str):
+        try:
+            a_flat = a_arr.reshape((-1,))
+            edges = _hist_edges_core(a_flat, bins, range)
+            w_arr = None
+            if weights is not None:
+                w_arr = weights if hasattr(weights, '_array') \
+                    else _rs.array(weights)
+                if tuple(w_arr.shape) != tuple(a_arr.shape):
+                    raise ValueError('weights should have the same shape as a.')
+            w_raw = w_arr.reshape((-1,))._array if w_arr is not None else None
+            w_float = w_arr is not None and not _hist_is_int_dtype(w_arr.dtype)
+            counts = _core.histdd_arrays([a_flat._array], [edges], w_raw)
+            return _hist_finalize(counts, edges, w_float, density)
+        except Exception:
+            pass  # 回退纯 Python 路径
     vals = [_builtins.float(v) for v in a_arr.reshape((-1,)).tolist()]
     n = len(vals)
     if weights is not None:
@@ -1085,40 +1198,19 @@ def histogram(a, bins=10, range=None, weights=None, density=None):
         w = w_arr.reshape((-1,)).tolist()
     else:
         w = None
-    if range is not None and len(range) != 2:
-        raise ValueError('range must be a sequence of two numbers')
     edges, _uniform = _hist_get_bin_edges(vals, bins, range, w)
     nb = len(edges) - 1
     w_float = w is not None and not _hist_is_int_dtype(
         (weights if hasattr(weights, '_array') else _rs.array(weights)).dtype)
-    # 分箱：core 直连（Rust 逐元素二分，NaN/越界不计）；失败回退纯 Python
-    try:
-        counts = _core.histdd_core([vals], [edges], w)
-    except Exception:
-        counts = [0.0] * nb if w_float else [0] * nb
-        for i in _builtins.range(n):
-            v = vals[i]
-            b = bisect.bisect_right(edges, v) - 1
-            if b == nb and v == edges[-1]:
-                b = nb - 1
-            if 0 <= b < nb:
-                counts[b] += (w[i] if w is not None else 1)
-    if density:
-        # —n / db / n.sum()，n 是入界计数(含 outlier 会失真)
-        total = _builtins.sum(_builtins.float(c) for c in counts)
-        if total > 0:
-            counts = [_builtins.float(counts[i]) / (total * (edges[i + 1] - edges[i]))
-                      for i in _builtins.range(nb)]
-        else:
-            counts = [0.0] * nb
-        return _rs.array(counts, dtype='float64'), _rs.array(edges, dtype='float64')
-    if w_float:
-        counts_arr = _rs.array([_builtins.float(c) for c in counts],
-                               dtype='float64')
-    else:
-        counts_arr = _rs.array([_builtins.int(c) for c in counts],
-                               dtype='int64')
-    return counts_arr, _rs.array(edges, dtype='float64')
+    counts = [0.0] * nb if w_float else [0] * nb
+    for i in _builtins.range(n):
+        v = vals[i]
+        b = bisect.bisect_right(edges, v) - 1
+        if b == nb and v == edges[-1]:
+            b = nb - 1
+        if 0 <= b < nb:
+            counts[b] += (w[i] if w is not None else 1)
+    return _hist_finalize(counts, edges, w_float, density)
 
 
 _H2D_DEFAULT = object()
@@ -1148,7 +1240,9 @@ def _hist2d_edges(spec, vals, rng):
             if lo == hi:
                 lo, hi = lo - 0.5, hi + 0.5
         step = (hi - lo) / nb
-        return [lo + step * i for i in _builtins.range(nb + 1)]
+        e = [lo + step * i for i in _builtins.range(nb + 1)]
+        e[-1] = hi  # 末边缘回写（与 1-D/dd 一致，避免浮点截断丢最大样本）
+        return e
     if hasattr(spec, '_array'):
         return [_builtins.float(e) for e in spec.reshape((-1,)).tolist()]
     return [_builtins.float(e) for e in _rs.array(spec).reshape((-1,)).tolist()]
@@ -1225,16 +1319,32 @@ def histogram2d(x, y, bins=_H2D_DEFAULT, range=_H2D_DEFAULT,
         bx_spec = by_spec = bins
     rng_x = range[0] if range is not None else None
     rng_y = range[1] if range is not None else None
-    xed = _hist2d_edges(bx_spec, xa, rng_x)
-    yed = _hist2d_edges(by_spec, ya, rng_y)
-    nbx = len(xed) - 1
-    nby = len(yed) - 1
-    # 分箱：core 直连（Rust 逐样本双维二分）；失败回退纯 Python
-    try:
-        flat = _core.histdd_core([xa, ya], [xed, yed], w)
-        count = [[flat[i * nby + j] for j in _builtins.range(nby)]
-                 for i in _builtins.range(nbx)]
-    except Exception:
+    # 分箱：core 快路径（Rust 逐样本双维二分，零 Python 往返）
+    count = None
+    if not isinstance(bx_spec, str) and not isinstance(by_spec, str):
+        try:
+            x_raw = (x if hasattr(x, '_array') else _rs.array(x)) \
+                .reshape((-1,))
+            y_raw = (y if hasattr(y, '_array') else _rs.array(y)) \
+                .reshape((-1,))
+            xed = _hist2d_edges_core(bx_spec, x_raw, rng_x)
+            yed = _hist2d_edges_core(by_spec, y_raw, rng_y)
+            nbx = len(xed) - 1
+            nby = len(yed) - 1
+            w_core = (w_raw.reshape((-1,))._array
+                      if weights is not None else None)
+            flat = _core.histdd_arrays([x_raw._array, y_raw._array],
+                                       [xed, yed], w_core)
+            count = [[flat[i * nby + j] for j in _builtins.range(nby)]
+                     for i in _builtins.range(nbx)]
+        except Exception:
+            count = None
+    if count is None:
+        # 回退纯 Python
+        xed = _hist2d_edges(bx_spec, xa, rng_x)
+        yed = _hist2d_edges(by_spec, ya, rng_y)
+        nbx = len(xed) - 1
+        nby = len(yed) - 1
         count = [[0.0] * nby for _ in _builtins.range(nbx)]
         for i in _builtins.range(N):
             bx = bisect.bisect_right(xed, xa[i]) - 1

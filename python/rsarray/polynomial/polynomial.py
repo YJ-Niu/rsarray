@@ -190,6 +190,14 @@ def polyval(x, c, tensor=True):
         if _is_py_scalar(x):
             return _pyval(cvals, x)
         xarr = NX.asanyarray(x)
+        # float 输入：core 直连（Rust Horner 单遍，避免逐系数整数组 dispatch）；
+        # int 输入保持原路径（Python int 精确算术，避免 f64 2^53 精度损失）
+        if str(getattr(xarr, '_dtype', ''))[:1] == 'f' \
+                and str(getattr(c, '_dtype', ''))[:1] == 'f':
+            try:
+                return _wrap(_core().polyval1d_core(xarr._array, c._array))
+            except Exception:
+                pass
         y = NX.zeros_like(xarr)
         for pv in reversed(cvals):
             y = y * xarr + pv
