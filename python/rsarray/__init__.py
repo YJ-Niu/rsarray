@@ -269,7 +269,7 @@ _sys.modules['rsarray'] = _current_module
 _sys.modules['rsarray.__init__'] = _current_module
 _current_module.__name__ = 'rsarray'
 
-__version__ = "1.2.10"
+__version__ = "1.2.11"
 
 # 捕获内建函数别名：_extra 挂载会向本模块 globals 注入同名的 rsarray 函数
 # （all/any/round），会遮蔽内建函数。以下别名保证本文件内部逻辑始终使用内建实现。
