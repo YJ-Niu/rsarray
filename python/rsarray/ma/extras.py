@@ -366,15 +366,9 @@ def notmasked_edges(a):
     return (np.array(first), np.array(last))
 
 
-def masked_all(a, axis=None, **kwargs):
-    """全部元素是否被掩掉（ma.masked_all 兼容）。"""
-    a = asarray(a)
-    m = getmaskarray(a)
-    if m is nomask:
-        return False
-    if axis is None:
-        return bool(m.all())
-    return m.all(axis=axis)
+def masked_all(shape, dtype=None):
+    """与 shape 同形的全掩码数组（ma.masked_all 兼容，numpy 构造器语义）。"""
+    return MaskedArray(np.zeros(shape, dtype=dtype), mask=True)
 
 
 def masked_all_like(a):

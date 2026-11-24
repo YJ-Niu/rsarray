@@ -282,9 +282,13 @@ def polyval(p, x):
     if isinstance(x, poly1d):
         y = 0
     else:
-        _m = getattr(x, '_mask', None)
-        if _m is not None and _m is not False:
-            _mask = NX.asarray(_m)
+        # MaskedArray 输入：取 data 数组（asanyarray(ma) 会退化成首元素
+        # 标量）；掩码照常传播到结果
+        if hasattr(x, '_mask'):
+            _m = x._mask
+            if _m is not None and _m is not False:
+                _mask = NX.asarray(_m)
+            x = NX.ma.getdata(x)
         x = NX.asanyarray(x)
         y = NX.zeros_like(x)
     # float 快路径：polyval1d_core（单遍 Horner 内核；p 降序 → 反转为

@@ -90,3 +90,62 @@ del _n
 __all__ = ['core', 'extras', 'mrecords', 'MaskedArray', 'MaskedRecords',
            'masked', 'nomask', 'array', 'asarray', 'masked_array', 'mrecarray',
            'MAError', 'MaskError', 'MaskType', 'MaskedArrayFutureWarning']
+
+
+# ---- 掩码感知聚合（numpy ma 语义：masked 视为 0/1；全掩码 → 0/1/masked）。
+# 覆盖此前从 statistics 泄漏进 ma 命名空间的无掩码感知实现。
+def _ma_is_masked(m):
+    return m is not nomask and m is not False and m is not None
+
+
+def sum(a, axis=None, dtype=None, out=None, keepdims=None):
+    """掩码感知求和：masked 元素视为 0（全掩码 → 0.0）。"""
+    a = asarray(a)
+    m = getmask(a)
+    filled_a = filled(a, 0) if _ma_is_masked(m) else getdata(a)
+    kwargs = {}
+    if axis is not None:
+        kwargs['axis'] = axis
+    if dtype is not None:
+        kwargs['dtype'] = dtype
+    if keepdims is not None:
+        kwargs['keepdims'] = keepdims
+    from rsarray.statistics import sum as _stat_sum
+    return _stat_sum(filled_a, **kwargs)
+
+
+def prod(a, axis=None, dtype=None, out=None, keepdims=None):
+    """掩码感知求积：masked 元素视为 1（全掩码 → 1.0）。"""
+    a = asarray(a)
+    m = getmask(a)
+    filled_a = filled(a, 1) if _ma_is_masked(m) else getdata(a)
+    kwargs = {}
+    if axis is not None:
+        kwargs['axis'] = axis
+    if dtype is not None:
+        kwargs['dtype'] = dtype
+    if keepdims is not None:
+        kwargs['keepdims'] = keepdims
+    return filled_a.prod(**kwargs)
+
+
+def mean(a, axis=None, dtype=None, out=None, keepdims=None):
+    """掩码感知均值：masked 元素不计入分母；全掩码 → masked。"""
+    import rsarray as _np
+    a = asarray(a)
+    m = getmask(a)
+    filled_a = filled(a, 0) if _ma_is_masked(m) else getdata(a)
+    cnt = int(a.size)
+    if _ma_is_masked(m):
+        cnt -= int(_np.asarray(m).astype('int64').sum())
+    if cnt == 0:
+        return MaskedArray(_np.array(0.0), mask=[True])
+    from rsarray.statistics import mean as _stat_mean
+    kwargs = {}
+    if axis is not None:
+        kwargs['axis'] = axis
+    if dtype is not None:
+        kwargs['dtype'] = dtype
+    if keepdims is not None:
+        kwargs['keepdims'] = keepdims
+    return _stat_mean(filled_a, **kwargs)

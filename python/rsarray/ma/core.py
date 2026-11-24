@@ -359,6 +359,52 @@ class MaskedArray:
         _ = out, keepdims
         return self._ma_extreme('max', axis)
 
+    def _ma_filled_data(self, fill):
+        """掩码位填 fill 的 data 数组（masked=False 原样返回）。"""
+        if self._mask is False or self._mask is None:
+            return self._data
+        msk = np.array(self._mask, dtype='bool').reshape((-1,))
+        flat_v = (self._data.reshape((-1,)).tolist()
+                  if self._data.ndim else [self._data.tolist()])
+        vals = [fill if mv else v for v, mv in zip(flat_v, msk)]
+        if self._data.ndim:
+            return np.array(vals).reshape(self._data.shape)
+        return np.array(vals[0])
+
+    def count(self, axis=None):
+        """非掩码元素计数。"""
+        m = np.array(self._mask, dtype='bool').reshape((-1,))
+        return builtins.int(m.size - m.sum()) if m.size else 0
+
+    def __float__(self):
+        # 0-d/单元素无掩码取值（numpy ma 语义）
+        return float(self._data)
+
+    def __int__(self):
+        return int(self._data)
+
+    def sum(self, axis=None, dtype=None, out=None, keepdims=False):
+        """掩码感知求和：masked 视为 0（全掩码 → 0.0）。"""
+        return MaskedArray(np.array(self._ma_filled_data(0.0).sum(axis=axis)))
+
+    def prod(self, axis=None, dtype=None, out=None, keepdims=False):
+        """掩码感知求积：masked 视为 1（全掩码 → 1.0）。"""
+        return MaskedArray(np.array(self._ma_filled_data(1.0).prod(axis=axis)))
+
+    def mean(self, axis=None, dtype=None, out=None, keepdims=False):
+        """掩码感知均值：masked 不计入分母；全掩码 → masked。"""
+        cnt = self.count()
+        if cnt == 0:
+            return MaskedArray(np.array(0.0), mask=[True])
+        return MaskedArray(np.array(self._ma_filled_data(0.0).sum() / cnt))
+
+    def argmax(self, axis=None, out=None, keepdims=False):
+        """掩码感知最大值索引：masked 位填 -inf 后取 argmax。"""
+        filled_a = self._ma_filled_data(float('-inf'))
+        if axis is None:
+            return builtins.int(filled_a.argmax())
+        return MaskedArray(np.array(filled_a.argmax(axis=axis)))
+
     # ------------------------------------------------------------------
     # 转置族（ma 语义：结果保留掩码）
     # ------------------------------------------------------------------
@@ -949,10 +995,17 @@ def filled(a, fill_value=None):
     return a
 
 
+def clip(a, a_min, a_max):
+    """掩码感知裁剪：data 裁剪后掩码原样保留。"""
+    a = asarray(a) if not isinstance(a, MaskedArray) else a
+    clipped = np.clip(a._data, a_min, a_max)
+    return MaskedArray(clipped, mask=a._mask, fill_value=a.fill_value)
+
+
 def anom(a, tol=1e-05):
-    """掩掉 |x| <= tol 的"异常零"值（ma.anom 兼容）。"""
-    a = np.asarray(a)
-    return MaskedArray(a, mask=(np.abs(a) <= tol))
+    """偏离均值（ma.anom 语义：x - mean(x)，均值忽略 masked 元素）。"""
+    a = asarray(a) if not isinstance(a, MaskedArray) else a
+    return a - a.mean()
 
 
 def minmax(a):

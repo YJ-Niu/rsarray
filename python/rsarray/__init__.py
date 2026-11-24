@@ -9366,6 +9366,10 @@ def _like_subok_result(result, a, subok):
 
 def zeros_like(a, dtype=None, order='K', subok=True, shape=None, device=None):
     """返回与输入形状相同的零数组（shape 参数可覆盖目标形状）。"""
+    # MaskedArray 输入：对 data 构造（numpy 语义 zeros_like(ma) → 普通数组）
+    if hasattr(a, '_mask') and not isinstance(a, ndarray):
+        return zeros_like(a._data, dtype=dtype, order=order, subok=subok,
+                          shape=shape, device=device)
     arr = ndarray(a)
     if isinstance(dtype, str):
         _parse_str_dtype(dtype)  # 校验 dtype 字符串（非法宽度如 'S-1' → TypeError）
