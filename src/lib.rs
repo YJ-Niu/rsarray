@@ -2979,6 +2979,110 @@ fn build_array_interface<'py>(
     Ok(dict)
 }
 
+enum FpSrc<'a> {
+    Arr(std::borrow::Cow<'a, [f64]>),
+    Sc(f64),
+}
+
+fn fp_parse<'a>(x: &'a Bound<'a, PyAny>) -> PyResult<FpSrc<'a>> {
+    if let Ok(arr) = x.cast::<NdArray>() {
+        let a = arr.borrow();
+        if a.imag.is_some() {
+            return Err(PyValueError::new_err("complex input"));
+        }
+        // 物化拷贝：借用链跨 PyRef 生命周期证明复杂，单次 O(n) 拷贝可忽略
+        return Ok(FpSrc::Arr(std::borrow::Cow::Owned(
+            a.data.iter().copied().collect(),
+        )));
+    }
+    if let Ok(s) = x.extract::<f64>() {
+        return Ok(FpSrc::Sc(s));
+    }
+    Err(PyValueError::new_err("unsupported input"))
+}
+
+fn fp_normalize(s: FpSrc<'_>) -> FpSrc<'_> {
+    // 长度 1 数组等效标量广播（同 Python 的 na = na * len(nb)）
+    match s {
+        FpSrc::Arr(d) if d.len() == 1 => FpSrc::Sc(d[0]),
+        other => other,
+    }
+}
+
+fn fp_get(s: &FpSrc<'_>, i: usize) -> f64 {
+    match s {
+        FpSrc::Arr(d) => d.get(i).copied().unwrap_or(0.0),
+        FpSrc::Sc(v) => *v,
+    }
+}
+
+fn fp_len(s: &FpSrc<'_>) -> usize {
+    match s {
+        FpSrc::Arr(d) => d.len(),
+        FpSrc::Sc(_) => 1,
+    }
+}
+
+/// add/subtract/multiply 的 errstate 触发快速路径（语义与 Python
+/// _fp_arith_check 逐条对齐）：overflow（有限输入 → ±inf，multiply
+/// 含 0×有限 → inf；add/subtract 同号/反号溢出且输入有限）、
+/// invalid（结果 nan：inf-inf / inf+(-inf) / 0×inf）、underflow
+/// （multiply：有限非零输入 → 0 或次正规）。实数 NdArray/float
+/// 标量输入；复数组/int 输入原逻辑逐元素跳过（等效无触发），由
+/// Python 侧先行拦截。返回 (ov, inv, un) 触发标记。
+#[pyfunction]
+fn fp_arith_check_core(
+    num: &Bound<'_, PyAny>,
+    oth: &Bound<'_, PyAny>,
+    res: &Bound<'_, PyAny>,
+    op: &str,
+) -> PyResult<(bool, bool, bool)> {
+    let sn = fp_normalize(fp_parse(num)?);
+    let so = fp_normalize(fp_parse(oth)?);
+    let sr = fp_normalize(fp_parse(res)?);
+    let n = fp_len(&sn).min(fp_len(&so));
+    let mut ov_f = false;
+    let mut inv_f = false;
+    let mut un_f = false;
+    let tiny = 2.2250738585072014e-308f64;
+    for i in 0..n {
+        let a = fp_get(&sn, i);
+        let b = fp_get(&so, i);
+        let r = fp_get(&sr, i);
+        let ai = a.is_infinite();
+        let bi = b.is_infinite();
+        let ri = r.is_infinite();
+        if op == "multiply" {
+            if ri && !(ai || bi) && a != 0.0 && b != 0.0 {
+                ov_f = true;
+            } else if r.is_nan() || (ri && (ai || bi) && (a == 0.0 || b == 0.0)) {
+                inv_f = true;
+            } else if !ai
+                && !bi
+                && a != 0.0
+                && b != 0.0
+                && !r.is_nan()
+                && (r == 0.0 || r.abs() < tiny)
+            {
+                un_f = true;
+            }
+        } else {
+            let ov = if op == "add" {
+                (a > 0.0 && b > 0.0 && ri && r > 0.0) || (a < 0.0 && b < 0.0 && ri && r < 0.0)
+            } else {
+                (a > 0.0 && b < 0.0 && ri && r > 0.0) || (a < 0.0 && b > 0.0 && ri && r < 0.0)
+            };
+            if ov && !(ai || bi) {
+                ov_f = true;
+            }
+            if ai && bi && r.is_nan() {
+                inv_f = true;
+            }
+        }
+    }
+    Ok((ov_f, inv_f, un_f))
+}
+
 #[pymodule]
 fn num_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NdArray>()?;
@@ -3010,6 +3114,7 @@ fn num_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fft::py_ifft_ndarray, m)?)?;
     m.add_function(wrap_pyfunction!(fft::py_rfft_ndarray, m)?)?;
     m.add_function(wrap_pyfunction!(fft::py_irfft_ndarray, m)?)?;
+    m.add_function(wrap_pyfunction!(fp_arith_check_core, m)?)?;
 
     let random_module = PyModule::new(m.py(), "random")?;
     random::init_module(&random_module)?;
