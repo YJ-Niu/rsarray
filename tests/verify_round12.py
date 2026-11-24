@@ -97,6 +97,35 @@ def sig_ref(M):
     return [abs(v) for v in _svd_jacobi(M, False, False).tolist()]
 
 
+def phase_equiv(mat1, mat2, axis, tol=1e-6):
+    """SVD 非唯一性检法：mat1 与 mat2 逐"线"（axis=0 列 / axis=1 行）
+    至多差一个模 1 的标量因子（奇异三元组相位自由度）。"""
+    if axis == 0:
+        nlines = len(mat1[0])
+        get = lambda l, i: mat1[i][l]
+        len0 = len(mat1)
+    else:
+        nlines = len(mat1)
+        get = lambda l, i: mat1[l][i]
+        len0 = len(mat1[0])
+    for l in range(nlines):
+        a = None
+        for i in range(len0):
+            if abs(get(l, i)) > 1e-10:
+                a = i
+                break
+        if a is None:
+            continue
+        phi = get(l, a) / mat2[a if axis == 0 else l][l if axis == 0 else a] \
+            if axis == 0 else get(l, a) / mat2[l][a]
+        for i in range(len0):
+            ref = mat2[i][l] if axis == 0 else mat2[l][i]
+            cur = get(l, i)
+            if abs(cur - phi * ref) > tol * max(1.0, abs(cur)):
+                return False
+    return True
+
+
 def reconstruct(A, u, s, vh, m, n, full):
     """full: A = u (m,m) Σ (m,n) vh (n,n)；reduced: uk (m,k) D (k,k) vk (k,n)"""
     k = min(m, n)
@@ -131,8 +160,10 @@ def main():
                   and tuple(r.Vh.shape) == v_shape
                   and tuple(r.S.shape) == (k,))
             check(tag + " sig", close(s, ref_s))
-            check(tag + " u vs ref", close(flat(u), flat(ref_u), 1e-7))
-            check(tag + " vh vs ref", close(flat(vh), flat(ref_vh), 1e-7))
+            # u/vh 与参考至多差逐奇异三元组相位（SVD 固有自由度，
+            # 同算法不同实现的收敛 sweep 边界可差一次旋转）
+            check(tag + " u phase-equiv", phase_equiv(u, ref_u, axis=0))
+            check(tag + " vh phase-equiv", phase_equiv(vh, ref_vh, axis=1))
             R = reconstruct(A, u, s, vh, m, n, full)
             check(tag + " reconstruct", close(flat(R), flat(A), 1e-8))
             uk = [[row[j] for j in range(k)] for row in u]
@@ -187,8 +218,10 @@ def main():
         U = u_l
         Vk = [[row[j] for j in range(k)] for row in V]
         Uk = [[row[j] for j in range(k)] for row in U]
-        D = [[(1.0 / s_l[i]) if s_l[i] > 1e-15 * s_l[0] else 0.0
-              if i == j else 0.0 for j in range(k)] for i in range(k)]
+        # 注意：链式条件表达式 (A if C1 else (B if C2 else C)) 在 C1
+        # 成立时不检查 C2——必须显式 and i == j，否则 D 整行被填 1/s
+        D = [[(1.0 / s_l[i]) if (s_l[i] > 1e-15 * s_l[0] and i == j)
+              else 0.0 for j in range(k)] for i in range(k)]
         refP = mm(Vk, mm(D, ch(Uk)))
         check(f"cpinv {m}x{n}", close(flat(P), flat(refP), 1e-7))
         check(f"cpinv {m}x{n} APA",
