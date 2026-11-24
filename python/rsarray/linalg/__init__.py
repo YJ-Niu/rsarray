@@ -634,7 +634,17 @@ def _norm_mat(M, ord):
         rowsums = [sum(row) for row in absM]
         return max(rowsums) if ord == float('inf') else min(rowsums)
     if ord in (2, -2, 'nuc'):
-        svals = [float(abs(v)) for v in _svd_jacobi(M, False, False).tolist()]
+        svals = None
+        try:
+            from rsarray import ndarray
+            svals = [float(abs(v)) for v in ndarray._wrap(
+                _core.linalg.svd_jacobi_sig(
+                    ndarray(M)._array)).tolist()]
+        except Exception:
+            svals = None
+        if svals is None:
+            svals = [float(abs(v)) for v in
+                     _svd_jacobi(M, False, False).tolist()]
         if not svals:
             return 0.0
         if ord == 2:
@@ -1681,8 +1691,21 @@ class linalg_module:
                              s.reshape(lead + tuple(results[0].S.shape)),
                              vt.reshape(lead + tuple(results[0].Vh.shape)))
 
+        def _core_ok(sub):
+            # core Jacobi SVD：2-d 非空实数矩阵（复数/空/异常回退
+            # 纯 Python Jacobi）
+            return (sub.ndim == 2 and sub.size > 0
+                    and not _is_complex_arr(sub))
+
         def _one(sub):
             if not compute_uv:
+                if _core_ok(sub):
+                    try:
+                        s = ndarray._wrap(
+                            _core.linalg.svd_jacobi_sig(sub._array))
+                        return s.astype(s_dt)
+                    except Exception:
+                        pass
                 s = _svd_jacobi(sub.tolist(), False, False)
                 return s.astype(s_dt)
             # Rust 2x2 SVD 只处理实输入（复数输入返回实 U/Vh，结果错误），
@@ -1701,6 +1724,15 @@ class linalg_module:
                         s_list = [row[i] for i, row in enumerate(s_list)]
                     return SVDResult(ndarray._wrap(u).astype(res_dt),
                                      ndarray(s_list).astype(s_dt),
+                                     ndarray._wrap(vt).astype(res_dt))
+                except Exception:
+                    pass
+            if _core_ok(sub):
+                try:
+                    u, s, vt = _core.linalg.svd_jacobi_uv(
+                        sub._array, full_matrices)
+                    return SVDResult(ndarray._wrap(u).astype(res_dt),
+                                     ndarray._wrap(s).astype(s_dt),
                                      ndarray._wrap(vt).astype(res_dt))
                 except Exception:
                     pass
@@ -2260,8 +2292,16 @@ class linalg_module:
                 try:
                     s = linalg_module.svd(sub, compute_uv=False).tolist()
                 except Exception:
-                    s = [float(abs(v)) for v in
-                         _svd_jacobi(sub.tolist(), False, False).tolist()]
+                    s = None
+                    try:
+                        from rsarray import ndarray
+                        s = [float(abs(v)) for v in ndarray._wrap(
+                            _core.linalg.svd_jacobi_sig(
+                                sub._array)).tolist()]
+                    except Exception:
+                        s = [float(abs(v)) for v in
+                             _svd_jacobi(sub.tolist(),
+                                         False, False).tolist()]
                 if not s:
                     r = float('nan')
                 elif p == -2:
