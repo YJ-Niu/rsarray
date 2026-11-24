@@ -291,7 +291,7 @@ def isnumeric(a):
     _char._unicode_only_guard(a, 'isnumeric')
     return _is(a, 'isnumeric')
 
-    
+
 isspace = lambda a: _is(a, 'isspace')        # noqa: E731
 istitle = lambda a: _is(a, 'istitle')        # noqa: E731
 isupper = lambda a: _is(a, 'isupper')        # noqa: E731
