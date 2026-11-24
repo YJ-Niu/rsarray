@@ -274,16 +274,24 @@ def _is(a, method):
 
 isalnum = lambda a: _is(a, 'isalnum')        # noqa: E731
 isalpha = lambda a: _is(a, 'isalpha')        # noqa: E731
+
+
 def isdecimal(a):
     # unicode-only：S（bytes）输入无 loop → no-loop 错误
     _char._unicode_only_guard(a, 'isdecimal')
     return _is(a, 'isdecimal')
+
+
 isdigit = lambda a: _is(a, 'isdigit')        # noqa: E731
 islower = lambda a: _is(a, 'islower')        # noqa: E731
+
+
 def isnumeric(a):
     # unicode-only：S（bytes）输入无 loop → no-loop 错误
     _char._unicode_only_guard(a, 'isnumeric')
     return _is(a, 'isnumeric')
+
+    
 isspace = lambda a: _is(a, 'isspace')        # noqa: E731
 istitle = lambda a: _is(a, 'istitle')        # noqa: E731
 isupper = lambda a: _is(a, 'isupper')        # noqa: E731

@@ -14,7 +14,6 @@ import math as _math
 import rsarray.num_core as _core
 
 
-
 __all__ = [
     'fft', 'ifft', 'rfft', 'irfft', 'irfftn',
     'fftshift', 'ifftshift', 'fftfreq', 'rfftfreq',

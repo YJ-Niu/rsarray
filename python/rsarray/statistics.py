@@ -361,7 +361,6 @@ def _flat_vals(x):
 def _values_equal(a, b):
     """逐元素比较（支持 0-d 标量与同形状数组）。"""
     try:
-        import builtins
         la = _flat_vals(a.tolist())
         lb = _flat_vals(b.tolist()) if hasattr(b, 'tolist') else _flat_vals([b])
         if len(la) != len(lb):
@@ -692,7 +691,8 @@ def quantile(a, q, axis=None, out=None, method='linear', keepdims=False,
             raise ValueError(
                 "interpolation and method cannot be used simultaneously")
     # * 100（整数乘法）：Fraction q 保持精确（Fraction*int=Fraction）；
-    # 嵌套列表递归缩放（结果形状按平铺 q，断言可广播）
+    # 嵌套列表递归缩放（结果形状按平铺 q，断言可广播
+
     def _scale_q(qq):
         if isinstance(qq, (list, tuple)):
             return [_scale_q(v) for v in qq]

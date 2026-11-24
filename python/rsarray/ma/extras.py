@@ -7,7 +7,7 @@
 """
 
 import rsarray as np
-from .core import (MAError, MaskedArray, asarray, array, count, filled,
+from .core import (MAError, MaskedArray, asarray, count,
                    getdata, getmaskarray, isMaskedArray, masked, mask_or,
                    nomask)
 
@@ -79,7 +79,7 @@ def ediff1d(to_edge=False):
                               "see ma.extras.ediff1d(a1, a2)")
 
 
-def ediff1d_impl(a1, a2=None):
+def ediff1d_impl(a1, a2=None, to_edge=False):  # noqa: F811
     """相邻元素差（ma.ediff1d 兼容）。"""
     if a2 is None:
         a = asarray(a1)
@@ -696,9 +696,10 @@ for _n, _v in _reexports().items():
     globals()[_n] = _v
 del _reexports, _n, _v
 
+
 # 修正 ediff1d 的公共入口（保持 签名 ediff1d(a1, a2=None)）
-def ediff1d(a1, a2=None):  # noqa: F811
-    return ediff1d_impl(a1, a2)
+def ediff1d(a1, a2=None, to_edge=False):  # noqa: F811
+    return ediff1d_impl(a1, a2, to_edge)
 
 
 __all__ = ['apply_along_axis', 'apply_over_axes', 'atleast_1d', 'atleast_2d',
@@ -706,6 +707,6 @@ __all__ = ['apply_along_axis', 'apply_over_axes', 'atleast_1d', 'atleast_2d',
            'compress_rowcols', 'corrcoef', 'cov', 'dot', 'ediff1d',
            'flatnotmasked_contiguous', 'in1d', 'intersect1d', 'isin',
            'masked_all', 'masked_all_like', 'mask_rowcols', 'median',
-           'ndenumerate', 'ndindex', 'notmasked_contiguous',
+           'ndenumerate', 'notmasked_contiguous',
            'notmasked_edges', 'setdiff1d', 'setxor1d', 'stack', 'union1d',
            'unique', 'unwrap', 'vstack', 'diagflat']

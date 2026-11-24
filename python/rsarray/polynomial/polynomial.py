@@ -10,7 +10,7 @@ deg 幂列表、__array_function__ 派发按 2.x 语义实现。
 import builtins
 import itertools as _itertools
 
-__all__ = [
+__all__ = [  # noqa: F822
     'polyzero', 'polyone', 'polyx', 'polydomain',
     'polyval', 'polyvalfromroots', 'polyval2d', 'polyval3d', 'polyvalnd',
     'polygrid2d', 'polygrid3d',
@@ -356,7 +356,7 @@ def polyder(c, m=1, scl=1, axis=0):
     if c.ndim == 1:
         return NX.array(_der1d(c.tolist(), m, scl))
     ax = 0 if axis is None else axis
-    fn = lambda v: _der1d(v, m, scl)
+    fn = lambda v: _der1d(v, m, scl)  # noqa: E731
     return _apply_along_axis(c, fn, ax)
 
 
@@ -383,7 +383,7 @@ def polyint(c, m=1, k=[], lbnd=0, scl=1, axis=0):
     if c.ndim == 1:
         return NX.array(_int1d(c.tolist(), m, klist, lbnd, scl))
     ax = 0 if axis is None else axis
-    fn = lambda v: _int1d(v, m, klist, lbnd, scl)
+    fn = lambda v: _int1d(v, m, klist, lbnd, scl)  # noqa: E731
     return _apply_along_axis(c, fn, ax)
 
 

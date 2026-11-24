@@ -429,7 +429,6 @@ def _eigvals_fl_dk(mat):
     多项式 p̃'，再对每个 DK 候选根做 3 步 Newton 抛光。n≤8 可靠；
     n≥9 系数量级（~‖A‖^n）超出 f64 有效位，根不可靠。
     """
-    import cmath
     n = len(mat)
     c = _fl_coefficients(mat)
     roots = _dk_roots(c)

@@ -2606,6 +2606,211 @@ fn svd_jacobi_uv(a: &NdArray, full_matrices: bool) -> PyResult<(NdArray, NdArray
     }
 }
 
+/// SVD 后组装核心（pinv / lstsq），内部复用已验证的 Jacobi SVD
+/// （实/复）；语义与 pinv._one / lstsq 的纯 Python 组装逐条对齐：
+/// cutoff = rcond * s_max（s_max = max(s)），rank = count(s > cutoff)；
+/// pinv 模式（b=None）：P[i][r] = Σ_j conj(vt[j][i])·s_inv[j]·
+/// conj(u[r][j])，s_inv==0 时跳过；
+/// lstsq 模式（b: (m,) / (m,r)）：uhb[j] = Σ_i conj(u[i][j])·b[i][c]，
+/// x[i][c] = Σ_j conj(vt[j][i])·s_inv[j]·uhb[j]；residuals =
+/// 逐列 Σ_i |b - A x|²，仅 m>n 且 rank==n 且 r>0 时非空。
+/// 返回 (P 或 x, residuals（pinv 模式为空）, rank, s)。
+#[pyfunction]
+#[pyo3(signature = (a, b=None, rcond=1e-15, mode=0))]
+fn svd_assemble_core(
+    a: &NdArray,
+    b: Option<&NdArray>,
+    rcond: f64,
+    mode: u8,
+) -> PyResult<(NdArray, NdArray, i64, NdArray)> {
+    fn build_2d(re: Vec<f64>, im: Option<Vec<f64>>, rows: usize, cols: usize) -> PyResult<NdArray> {
+        let data = Array::from_shape_vec(IxDyn(&[rows, cols]), re)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let imag = match im {
+            Some(v) => Some(
+                Array::from_shape_vec(IxDyn(&[rows, cols]), v)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            ),
+            None => None,
+        };
+        Ok(NdArray { data, imag })
+    }
+    let (m, n, data, imag) = svd_jacobi_check(a)?;
+    let (u, s, vh) = match &imag {
+        None => {
+            let (u, _us, s, vh, _vs) = svd_jacobi_impl(&data, m, n, false);
+            (
+                u.iter().map(|&r| (r, 0.0)).collect::<Vec<_>>(),
+                s,
+                vh.iter().map(|&r| (r, 0.0)).collect::<Vec<_>>(),
+            )
+        }
+        Some(im) => {
+            let (u_re, u_im, _us, s, vh_re, vh_im, _vs) =
+                svd_jacobi_impl_c(&data, im, m, n, false)?;
+            (
+                u_re.iter()
+                    .zip(u_im.iter())
+                    .map(|(&r, &i)| (r, i))
+                    .collect(),
+                s,
+                vh_re
+                    .iter()
+                    .zip(vh_im.iter())
+                    .map(|(&r, &i)| (r, i))
+                    .collect(),
+            )
+        }
+    };
+    let is_c = a.imag.is_some();
+    let k = m.min(n);
+    let s_max = s.iter().cloned().fold(0.0f64, f64::max);
+    let cutoff = rcond * s_max;
+    let rank = s.iter().filter(|v| **v > cutoff).count() as i64;
+    let s_inv: Vec<f64> = s
+        .iter()
+        .map(|v| if *v > cutoff { 1.0 / v } else { 0.0 })
+        .collect();
+    let s_arr = Array::from_shape_vec(IxDyn(&[s.len()]), s.clone())
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let s_out = NdArray {
+        data: s_arr,
+        imag: None,
+    };
+    if mode == 0 {
+        // pinv：P = V·D⁺·U^H（s_inv 为 0 的三元组跳过，语义同 pinv._one）
+        if b.is_some() {
+            return Err(PyValueError::new_err(
+                "svd_assemble_core: pinv mode takes no b",
+            ));
+        }
+        let mut p_re = vec![0.0; n * m];
+        let mut p_im = vec![0.0; n * m];
+        for j in 0..k {
+            let si = s_inv[j];
+            if si == 0.0 {
+                continue;
+            }
+            for i in 0..n {
+                let a1 = sc_mul(cj(vh[j * n + i]), si);
+                if a1 == (0.0, 0.0) {
+                    continue;
+                }
+                for r in 0..m {
+                    let t = gj_cmul(a1, cj(u[r * k + j]));
+                    p_re[i * m + r] += t.0;
+                    p_im[i * m + r] += t.1;
+                }
+            }
+        }
+        let p = build_2d(p_re, if is_c { Some(p_im) } else { None }, n, m)?;
+        let res_arr = Array::from_shape_vec(IxDyn(&[0]), vec![])
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        return Ok((
+            p,
+            NdArray {
+                data: res_arr,
+                imag: None,
+            },
+            rank,
+            s_out,
+        ));
+    }
+    // lstsq：b 校验 (m,) 或 (m, r)
+    let b_arr = match b {
+        Some(x) => x,
+        None => {
+            return Err(PyValueError::new_err(
+                "svd_assemble_core: lstsq mode requires b",
+            ));
+        }
+    };
+    let bs: Vec<usize> = b_arr.data.shape().to_vec();
+    let n_rhs = match bs.as_slice() {
+        [mm] if *mm == m => 1,
+        [mm, rr] if *mm == m => *rr,
+        _ => {
+            return Err(PyValueError::new_err(
+                "svd_assemble_core: b must be (m,) or (m, r)",
+            ));
+        }
+    };
+    let is_bc = b_arr.imag.is_some();
+    let bre: Vec<f64> = b_arr.data.iter().copied().collect();
+    let bim: Vec<f64> = b_arr
+        .imag
+        .as_ref()
+        .map(|x| x.iter().copied().collect())
+        .unwrap_or_default();
+    let bvec: Vec<(f64, f64)> = if is_bc {
+        bre.iter().zip(bim.iter()).map(|(&r, &i)| (r, i)).collect()
+    } else {
+        bre.iter().map(|&r| (r, 0.0)).collect()
+    };
+    let aim: Vec<f64> = match &imag {
+        Some(v) => v.clone(),
+        None => vec![0.0; m * n],
+    };
+    // x = Vh^H · diag(1/s) · U^H · b（运算次序与 Python 逐条对齐）
+    let mut x_re = vec![0.0; n * n_rhs];
+    let mut x_im = vec![0.0; n * n_rhs];
+    for c in 0..n_rhs {
+        let mut uhb: Vec<(f64, f64)> = vec![(0.0, 0.0); k];
+        for j in 0..k {
+            for i in 0..m {
+                let t = cj_mul(u[i * k + j], bvec[i * n_rhs + c]);
+                uhb[j] = (uhb[j].0 + t.0, uhb[j].1 + t.1);
+            }
+        }
+        for i in 0..n {
+            let mut acc = (0.0, 0.0);
+            for j in 0..k {
+                let t = gj_cmul(sc_mul(cj(vh[j * n + i]), s_inv[j]), uhb[j]);
+                acc = (acc.0 + t.0, acc.1 + t.1);
+            }
+            x_re[i * n_rhs + c] = acc.0;
+            x_im[i * n_rhs + c] = acc.1;
+        }
+    }
+    // 残差：m>n 且满列秩时逐列 Σ |b - A x|²（与 Python 同次序）
+    let compute_res = m > n && rank == n as i64 && n_rhs > 0;
+    let mut res_vals: Vec<f64> = vec![];
+    if compute_res {
+        for c in 0..n_rhs {
+            let mut acc = 0.0f64;
+            for i in 0..m {
+                let mut r = bvec[i * n_rhs + c];
+                for kk in 0..n {
+                    let t = gj_cmul(
+                        (data[i * n + kk], aim[i * n + kk]),
+                        (x_re[kk * n_rhs + c], x_im[kk * n_rhs + c]),
+                    );
+                    r = (r.0 - t.0, r.1 - t.1);
+                }
+                acc += gj_mag(r).powi(2);
+            }
+            res_vals.push(acc);
+        }
+    }
+    let x = build_2d(
+        x_re,
+        if is_c || is_bc { Some(x_im) } else { None },
+        n,
+        n_rhs,
+    )?;
+    let res_arr = Array::from_shape_vec(IxDyn(&[res_vals.len()]), res_vals)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((
+        x,
+        NdArray {
+            data: res_arr,
+            imag: None,
+        },
+        rank,
+        s_out,
+    ))
+}
+
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dot, m)?)?;
     m.add_function(wrap_pyfunction!(vdot, m)?)?;
@@ -2630,5 +2835,6 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gj_solve_core, m)?)?;
     m.add_function(wrap_pyfunction!(svd_jacobi_sig, m)?)?;
     m.add_function(wrap_pyfunction!(svd_jacobi_uv, m)?)?;
+    m.add_function(wrap_pyfunction!(svd_assemble_core, m)?)?;
     Ok(())
 }

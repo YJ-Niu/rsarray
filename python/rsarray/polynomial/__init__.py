@@ -127,6 +127,7 @@ def polyroots(p):
     import math
     _c = (p.coef if isinstance(p, Poly)
           else (p.tolist() if hasattr(p, 'tolist') else list(p)))
+          
     def _has_nan(v):
         if isinstance(v, (list, tuple)):
             return any(_has_nan(x) for x in v)

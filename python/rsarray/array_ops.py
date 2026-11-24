@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 import builtins
 import itertools
-import math
+from collections import namedtuple
 
 """数组操作模块 - 所有实现位于 Rust，这里仅保留薄包装。"""
 
@@ -1535,7 +1535,6 @@ def unique(a, return_index=False, return_inverse=False, return_counts=False,
 
 
 # ========== Array API 风格的 unique 包装 ==========
-from collections import namedtuple
 
 _UniqueInv = namedtuple("UniqueAll", ["values", "inverse_indices"])
 _UniqueAll = namedtuple("UniqueAll", ["values", "indices",

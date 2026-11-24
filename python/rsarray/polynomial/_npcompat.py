@@ -122,6 +122,7 @@ def roots(p):
         p_list = p_list[1:]
     # 系数含 NaN：伴矩阵特征值未定义，与标准语义一致抛 LinAlgError
     import math
+    
     def _has_nan(v):
         try:
             return math.isnan(float(v))
