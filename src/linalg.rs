@@ -3686,6 +3686,60 @@ fn eig_vectors_core(a: &NdArray, evals: &NdArray) -> PyResult<NdArray> {
     })
 }
 
+/// 1-D/全归约中位数（语义与 Python _median_py axis=None 对齐）：
+/// NaN 传染（任一元素 NaN → 结果 NaN）；排序 complex 按 (real, imag)
+/// 字典序（同 _ckey）；奇数取 vs[n/2]，偶数取 (vs[n/2-1]+vs[n/2])/2。
+/// 返回 (1,) complex NdArray（实输入 imag=0）。
+#[pyfunction]
+fn median_core(a: &NdArray) -> PyResult<NdArray> {
+    let n = a.data.len();
+    if n == 0 {
+        return Err(PyValueError::new_err("empty input"));
+    }
+    let has_imag = a.imag.is_some();
+    let mut vals: Vec<(f64, f64)> = match &a.imag {
+        None => a.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => a
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    // NaN 传染：任一元素 NaN → 结果 NaN
+    let nan = vals.iter().any(|z| z.0.is_nan() || z.1.is_nan());
+    let r = if nan {
+        (f64::NAN, f64::NAN)
+    } else {
+        if has_imag {
+            // complex 按 (real, imag) 字典序（同 _ckey）
+            vals.sort_by(|x, y| {
+                x.0.partial_cmp(&y.0)
+                    .unwrap()
+                    .then(x.1.partial_cmp(&y.1).unwrap())
+            });
+        } else {
+            vals.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+        }
+        if n % 2 == 1 {
+            vals[n / 2]
+        } else {
+            let x = vals[n / 2 - 1];
+            let y = vals[n / 2];
+            ((x.0 + y.0) / 2.0, (x.1 + y.1) / 2.0)
+        }
+    };
+    let data = Array::from_shape_vec(IxDyn(&[1]), vec![r.0])
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let imag = Array::from_shape_vec(IxDyn(&[1]), vec![r.1])
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    // 实数输入返回实通道（Python 侧 tolist 得 float，不是 complex）
+    Ok(NdArray {
+        data,
+        imag: if has_imag { Some(imag) } else { None },
+    })
+}
+
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dot, m)?)?;
     m.add_function(wrap_pyfunction!(vdot, m)?)?;
@@ -3715,6 +3769,7 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eigvals_qr_core, m)?)?;
     m.add_function(wrap_pyfunction!(eig_power_core, m)?)?;
     m.add_function(wrap_pyfunction!(eig_vectors_core, m)?)?;
+    m.add_function(wrap_pyfunction!(median_core, m)?)?;
     m.add_function(wrap_pyfunction!(eigvals_qr_batch_core, m)?)?;
     Ok(())
 }

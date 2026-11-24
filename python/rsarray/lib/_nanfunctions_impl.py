@@ -1539,6 +1539,17 @@ def _median_py(a, axis, out, keepdims):
     shape = tuple(a.shape)
     nd = len(shape)
     axes = _reduce_axes(axis, nd)
+    # axis=None（或全归约）+ 数值 dtype：Rust 内核（跳过 tolist/Python
+    # 排序全链）；NaN 传染语义与空数组由内核 Err 回退。必须在 tolist 前。
+    if not _m8_label_of(dt) and k in 'efc' and set(axes) == set(range(nd)):
+        try:
+            import rsarray.num_core as _core_med
+            results = _core_med.linalg.median_core(a._array).tolist()
+        except Exception:
+            results = None
+        if results is not None:
+            res_dt = _dtype_name(dt) if k in 'efc' else 'float64'
+            return _reduce_wrap(results, axes, shape, keepdims, res_dt, out, a)
     flat = _flat_list(a.tolist())
     m8s = _m8_label_of(dt)
     sentinel = _INT64_MIN if m8s else None
