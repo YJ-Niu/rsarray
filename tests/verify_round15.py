@@ -137,6 +137,21 @@ def main():
     t_new = time.perf_counter() - t0
     print(f"BENCH eigvals 60x60 complex: py={t_old*1e3:.0f}ms "
           f"core={t_new*1e3:.1f}ms x{t_old / max(t_new, 1e-9):.0f}")
+    # ---- bench：stacked 批量（8 批 × 60×60，批量内核一次 FFI）----
+    As = [rand_mat(60, complex_=True) for _ in range(8)]
+    t0 = time.perf_counter()
+    for a in As:
+        _eigvals_qr(a)
+    t_old = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    linalg_module.eigvals(np.array(As))
+    t_new = time.perf_counter() - t0
+    print(f"BENCH eigvals stacked (8,60,60): py={t_old*1e3:.0f}ms "
+          f"core={t_new*1e3:.1f}ms x{t_old / max(t_new, 1e-9):.0f}")
+    # 批量结果正确性
+    got = linalg_module.eigvals(np.array(As)).tolist()
+    check("eigvals stacked batch values",
+          all(sorted_cmp(got[i], _eigvals_qr(As[i])) for i in range(8)))
 
     print()
     print(f"{PASS[0]} passed, {FAIL[0]} failed")

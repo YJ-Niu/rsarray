@@ -3355,6 +3355,92 @@ fn eigvals_qr_core(a: &NdArray) -> PyResult<NdArray> {
     })
 }
 
+/// 批量特征值：stacked (..., n, n) 一次 FFI 内逐批 QR 迭代（消除
+/// Python 侧逐批内核调用 + wrap/tolist 往返）。要求 n ≥ 9（n<8 的
+/// FL+DK 小矩阵语义保持 Python），n<9 或非方阵 → Err。
+/// 返回 (evals (B, n) complex, ok (B,) f64)：单批不收敛 → 该行 NaN
+/// 且 ok=0，由 Python 侧对该批回退纯 Python。
+#[pyfunction]
+fn eigvals_qr_batch_core(a: &NdArray) -> PyResult<(NdArray, NdArray)> {
+    let shape: Vec<usize> = a.data.shape().to_vec();
+    if shape.len() < 3 {
+        return Err(PyValueError::new_err(
+            "eigvals_qr_batch_core: a must be (..., n, n)",
+        ));
+    }
+    let n = shape[shape.len() - 1];
+    if shape[shape.len() - 2] != n {
+        return Err(PyValueError::new_err(
+            "eigvals_qr_batch_core: a must be square (..., n, n)",
+        ));
+    }
+    if n < 9 {
+        return Err(PyValueError::new_err(
+            "eigvals_qr_batch_core: n < 9 stays on the Python FL+DK path",
+        ));
+    }
+    let b: usize = shape[..shape.len() - 2].iter().product();
+    let nn = n * n;
+    let mut out_re = vec![f64::NAN; b * n];
+    let mut out_im = vec![f64::NAN; b * n];
+    let mut ok = vec![1.0f64; b];
+    for bi in 0..b {
+        let base = bi * nn;
+        let mut work: Vec<(f64, f64)> = match &a.imag {
+            None => a
+                .data
+                .iter()
+                .skip(base)
+                .take(nn)
+                .map(|&r| (r, 0.0))
+                .collect(),
+            Some(im) => a
+                .data
+                .iter()
+                .zip(im.iter())
+                .skip(base)
+                .take(nn)
+                .map(|(&r, &i)| (r, i))
+                .collect(),
+        };
+        hessenberg_reduce(&mut work, n);
+        let mut evals: Vec<(f64, f64)> = vec![];
+        let mut it = 0usize;
+        match qr_window(&mut work, n, 0, n - 1, &mut evals, &mut it) {
+            Ok(()) => {
+                for (i, z) in evals.iter().enumerate() {
+                    if z.1.abs() < 1e-11 * f64::max(1.0, z.0.abs()) {
+                        out_re[bi * n + i] = z.0;
+                        out_im[bi * n + i] = 0.0;
+                    } else {
+                        out_re[bi * n + i] = z.0;
+                        out_im[bi * n + i] = z.1;
+                    }
+                }
+            }
+            Err(_) => {
+                ok[bi] = 0.0;
+            }
+        }
+    }
+    let data = Array::from_shape_vec(IxDyn(&[b, n]), out_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let imag = Array::from_shape_vec(IxDyn(&[b, n]), out_im)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let ok_arr =
+        Array::from_shape_vec(IxDyn(&[b]), ok).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((
+        NdArray {
+            data,
+            imag: Some(imag),
+        },
+        NdArray {
+            data: ok_arr,
+            imag: None,
+        },
+    ))
+}
+
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dot, m)?)?;
     m.add_function(wrap_pyfunction!(vdot, m)?)?;
@@ -3382,5 +3468,6 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(svd_assemble_core, m)?)?;
     m.add_function(wrap_pyfunction!(qr_householder_core, m)?)?;
     m.add_function(wrap_pyfunction!(eigvals_qr_core, m)?)?;
+    m.add_function(wrap_pyfunction!(eigvals_qr_batch_core, m)?)?;
     Ok(())
 }

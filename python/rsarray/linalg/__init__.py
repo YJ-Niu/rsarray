@@ -1608,6 +1608,8 @@ class linalg_module:
         lead, subs = _stacked_2d(a_arr)
         # core QR 迭代（n≥9 大矩阵热点；n≤8 的 FL+DK 小矩阵留 Python，
         # 不收敛 → core 返回 Err 回退纯 Python 旧行为下界）
+        # 批量 core：n≥9 时 stacked 一次 FFI 内逐批 QR 迭代（消除逐批
+        # 内核调用 + wrap/tolist 往返）；n<9 或失败批回退纯 Python
         if len(shape) == 2:
             if shape[-1] >= 9:
                 try:
@@ -1617,6 +1619,23 @@ class linalg_module:
                 except Exception:
                     pass
             return ndarray(_eigvals_qr(a_arr.tolist())).astype(out_dt)
+        if shape[-1] >= 9:
+            try:
+                flat_evals, batch_ok = _core.linalg.eigvals_qr_batch_core(
+                    a_arr._array)
+                flat_list = ndarray._wrap(flat_evals).tolist()
+                ok_list = ndarray._wrap(batch_ok).tolist()
+                if all(ok_list):
+                    return ndarray(flat_list).reshape(
+                        lead + (shape[-1],)).astype(out_dt)
+                # 失败批逐个回退纯 Python（FL+DK 旧行为下界）
+                for i, good in enumerate(ok_list):
+                    if not good:
+                        flat_list[i] = _eigvals_qr(subs[i].tolist())
+                return ndarray(flat_list).reshape(
+                    lead + (shape[-1],)).astype(out_dt)
+            except Exception:
+                pass
         evals_list = []
         for sub in subs:
             if sub.shape[-1] >= 9:
