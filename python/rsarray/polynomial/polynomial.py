@@ -519,6 +519,26 @@ def polyfit(x, y, deg, rcond=None, full=False, w=None, cov=False):
     xvals = x.tolist()
     yvals = y.tolist()
     wvals = w.tolist() if w is not None else None
+    # 实数快路径：Rust 构造 Vandermonde rows（消除 O(n·deg) Python 列表
+    # 推导 + 数组重建），rows 直传 lstsq（已核心化）；复数走原路径。
+    _x_c = getattr(x, '_dtype', '') in ('complex64', 'complex128')
+    _y_c = getattr(y, '_dtype', '') in ('complex64', 'complex128')
+    if not (_x_c or _y_c):
+        try:
+            import rsarray.num_core as _core_pf
+            _w_arr = NX.asarray(w)._array if w is not None else None
+            _rows_arr = _core_pf.polyfit_rows_core(x._array, order, _w_arr)
+            _Y = y._array if y.ndim == 1 else \
+                NX.array([list(row) for row in yvals])
+            _sol, _resids, _rank, _sv = NX.linalg.lstsq(
+                NX.ndarray._wrap(_rows_arr), _Y, rcond=rcond)
+            if y.ndim == 1 and _sol.ndim == 2:
+                _sol = NX.array([v[0] for v in _sol.tolist()])
+            if full:
+                return _sol, _resids, _rank, _sv
+            return _sol
+        except Exception:
+            pass
     rows = []
     for i, xv in enumerate(xvals):
         s = (wvals[i] ** 0.5) if wvals is not None else 1.0

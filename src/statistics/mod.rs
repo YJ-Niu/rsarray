@@ -1151,6 +1151,47 @@ fn nan_groups_allnan(x: &NdArray, axis: Option<isize>) -> PyResult<bool> {
     Ok(false)
 }
 
+/// Vandermonde 矩阵构造（polyfit）：rows[i][d] = x[i]^d·√w[i]
+/// （w=None 时 √w=1；逐次累乘 p *= xv，幂次 0..=order）。实数输入；
+/// 复数 → Err（Python 复数路径兜底）。输出 (n, order+1)。
+#[pyfunction]
+#[pyo3(signature = (x, order, w))]
+fn polyfit_rows_core(x: &NdArray, order: usize, w: Option<NdArray>) -> PyResult<NdArray> {
+    if x.imag.is_some() {
+        return Err(PyValueError::new_err("complex input"));
+    }
+    let n = x.data.len();
+    if n == 0 {
+        return Err(PyValueError::new_err("empty input"));
+    }
+    let xw: Vec<f64> = x.data.iter().copied().collect();
+    let wv: Option<Vec<f64>> = w
+        .as_ref()
+        .map(|wa| wa.data.iter().map(|&v| v.sqrt()).collect());
+    let mut out = vec![0.0f64; n * (order + 1)];
+    for i in 0..n {
+        let xv = xw[i];
+        let sw = match &wv {
+            None => 1.0,
+            Some(wl) => {
+                let s = wl[i];
+                (s * s).sqrt()
+            }
+        };
+        let mut p = 1.0f64;
+        for d in 0..=order {
+            out[i * (order + 1) + d] = p * sw;
+            p *= xv;
+        }
+    }
+    let arr = Array::from_shape_vec(IxDyn(&[n, order + 1]), out)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        data: arr,
+        imag: None,
+    })
+}
+
 /// 沿轴求和（NaN 视为 0）。
 #[pyfunction]
 #[pyo3(signature = (x, axis=None, keepdims=false))]
@@ -1778,6 +1819,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(trim_zeros, m)?)?;
     m.add_function(wrap_pyfunction!(bincount_weighted, m)?)?;
     m.add_function(wrap_pyfunction!(nansum, m)?)?;
+    m.add_function(wrap_pyfunction!(polyfit_rows_core, m)?)?;
     m.add_function(wrap_pyfunction!(nan_groups_allnan, m)?)?;
     m.add_function(wrap_pyfunction!(nanprod, m)?)?;
     m.add_function(wrap_pyfunction!(nanmax, m)?)?;

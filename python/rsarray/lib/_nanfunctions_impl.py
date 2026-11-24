@@ -1473,6 +1473,21 @@ def _percentile_public(a, q, axis, out, overwrite_input, method, keepdims,
         return _percentile_engine(a, q, axis, keepdims, 'int64', out=out,
                                   weights=weights, method=m, nan_filter=nan_filter,
                                   scale=scale, sentinel=_INT64_MIN, relabel=m8s)
+    # 常见路径快车道：实数 + linear + 标量 q + axis=None + 无 weights
+    # （Rust 排序 + linear 虚指数插值；NaN 过滤/传染语义与引擎一致）
+    if (k in 'ef' and m == 'linear' and axis is None and weights is None
+            and not isinstance(q, (list, tuple))
+            and not hasattr(q, 'ndim')
+            and not isinstance(q, _frac_type())):
+        try:
+            import rsarray.num_core as _core_pe
+            _pv = _core_pe.linalg.percentile_core(
+                a._array, float(q) / scale, bool(nan_filter))
+            _res_dt = _dtype_name(dt)
+            return _reduce_wrap([_pv], (0,), tuple(a.shape), keepdims,
+                                _res_dt, out, a)
+        except Exception:
+            pass
     qvals, promote, exact01, qarr = _q_values(q, scale)
     if isinstance(q, (list, tuple)):
         q_shape = _list_shape(q) or (len(qvals),)

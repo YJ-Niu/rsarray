@@ -237,6 +237,10 @@ def polyfit(x, y, deg, rcond=None, full=False, w=None, cov=False):
     scale = NX.sqrt((lhs * lhs).sum(axis=0))
     lhs = lhs / scale
     c, resids, rank, s = NX.linalg.lstsq(lhs, rhs, rcond)
+    if rhs.ndim == 1 and getattr(c, 'ndim', 0) == 2:
+        # lstsq 对 1-D b 可能返回 (n,1) → 压平为 (n,)
+        # （与 polynomial.polyfit 的同款处理一致）
+        c = NX.array([v[0] for v in c.tolist()])
     c = (c.T / scale).T
     if rank != order and not full:
         _py_warnings.warn("Polyfit may be poorly conditioned",
@@ -273,6 +277,18 @@ def polyval(p, x):
             _mask = NX.asarray(_m)
         x = NX.asanyarray(x)
         y = NX.zeros_like(x)
+    # float 快路径：polyval1d_core（单遍 Horner 内核；p 降序 → 反转为
+    # 升序后传入）。ma 掩码/poly1d/子类/非 float 走原路径。
+    try:
+        if (_mask is None and not isinstance(x, poly1d)
+                and type(x) is NX.ndarray and getattr(p, 'ndim', 0) == 1
+                and str(getattr(p, '_dtype', ''))[:1] == 'f'
+                and str(getattr(x, '_dtype', ''))[:1] == 'f'):
+            import rsarray.num_core as _core_pv
+            _p_rev = p[::-1]
+            return _core_pv.polyval1d_core(x._array, _p_rev._array)
+    except Exception:
+        pass
     for pv in p:
         y = y * x + pv
     if _mask is not None:

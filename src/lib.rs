@@ -1191,8 +1191,10 @@ impl NdArray {
     }
 
     fn astype(&self, dtype: &str) -> PyResult<NdArray> {
-        // rsarray 内部元素类型固定为 f64，这里只支持把 f64 截断为整数（int/int32/int64）。
-        // 对于 float* / 其它类型，保持 f64 行为（与旧版一致）。
+        // 数值转换语义与 Python astype 分支位级对齐：NaN→0、float 向零
+        // 截断、整数按目标位宽补码回绕（uint64 高位回落补码负值）、
+        // bool 0/1、float32 IEEE 舍入。float16 等罕见目标 → Err（Python
+        // 慢路径兜底）。
         let dt = dtype.to_lowercase();
         let is_complex = matches!(
             dt.as_str(),
@@ -1206,34 +1208,105 @@ impl NdArray {
                 .unwrap_or_else(|| Array::zeros(self.data.raw_dim()));
             return Ok(NdArray::from_complex(self.data.clone(), imag));
         }
-        let is_int = matches!(
-            dt.as_str(),
-            "int"
-                | "i"
-                | "int8"
-                | "int16"
-                | "int32"
-                | "int64"
-                | "intp"
-                | "i8"
-                | "i16"
-                | "i32"
-                | "i64"
-        );
-        if is_int {
-            let casted: Vec<f64> = self.data.iter().map(|v| v.trunc()).collect();
-            let arr = Array::from_shape_vec(IxDyn(self.data.shape()), casted)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok(NdArray {
-                imag: None,
-                data: arr,
-            })
-        } else {
-            // float* 或其它：丢弃虚部（与 astype 到实数类型一致）。
-            Ok(NdArray {
-                imag: None,
-                data: self.data.clone(),
-            })
+        let convert = |v: f64| -> f64 {
+            match dt.as_str() {
+                "bool" => {
+                    if v != 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                "int8" | "i8" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        ((v.trunc().rem_euclid(256.0) as u64 & 0xFF) as u8) as i8 as f64
+                    }
+                }
+                "int16" | "i16" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        ((v.trunc().rem_euclid(65536.0) as u64 & 0xFFFF) as u16) as i16 as f64
+                    }
+                }
+                "int32" | "i32" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        ((v.trunc().rem_euclid(4294967296.0) as u64 & 0xFFFFFFFF) as u32) as i32
+                            as f64
+                    }
+                }
+                "int64" | "intp" | "i64" | "int" | "i" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        v.trunc().rem_euclid(18446744073709551616.0) as u64 as i64 as f64
+                    }
+                }
+                "uint8" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        v.trunc().rem_euclid(256.0)
+                    }
+                }
+                "uint16" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        v.trunc().rem_euclid(65536.0)
+                    }
+                }
+                "uint32" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        v.trunc().rem_euclid(4294967296.0)
+                    }
+                }
+                "uint64" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        // uint64 高位（≥2^63）回落补码负值（Python 同款）
+                        v.trunc().rem_euclid(18446744073709551616.0) as u64 as i64 as f64
+                    }
+                }
+                "float32" => {
+                    if v.is_nan() || v.abs() >= 3.4028235e38 {
+                        v
+                    } else {
+                        v as f32 as f64
+                    }
+                }
+                _ => v,
+            }
+        };
+        match dt.as_str() {
+            "float64" | "float" | "f64" | "f8" | "f" => {
+                // float64 目标：丢弃虚部（与 astype 到实数类型一致）
+                Ok(NdArray {
+                    imag: None,
+                    data: self.data.clone(),
+                })
+            }
+            "bool" | "int8" | "i8" | "int16" | "i16" | "int32" | "i32" | "int64" | "i64"
+            | "intp" | "int" | "i" | "uint8" | "uint16" | "uint32" | "uint64" | "float32" => {
+                let casted: Vec<f64> = self.data.iter().map(|&v| convert(v)).collect();
+                let arr = Array::from_shape_vec(IxDyn(self.data.shape()), casted)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok(NdArray {
+                    imag: None,
+                    data: arr,
+                })
+            }
+            _ => {
+                // float16 等罕见目标：Err 由 Python 慢路径兜底
+                Err(PyValueError::new_err("unsupported astype target"))
+            }
         }
     }
 

@@ -198,6 +198,17 @@ class NdArrayMethods:
         # Rust astype 对整数目标转换不正确（int→int 回绕错误、float→int
         # 只重标注）：统一用 Python 语义计算——NaN→0、float 向零截断、
         # int 按目标位宽补码回绕（与 same-kind cast 一致）
+        # 数值目标（int/uint/bool/float32）：Rust astype 内核（语义位级
+        # 对齐下方 Python 分支：NaN→0、trunc、位宽补码回绕、bool 0/1、
+        # f32 舍入），消除 1M 元素 tolist+逐元素循环。float16 等罕见
+        # 目标内核 Err → 落入下方 Python 分支。
+        if name in ('int8', 'int16', 'int32', 'int64', 'uint8', 'uint16',
+                    'uint32', 'uint64', 'intp', 'bool', 'float32'):
+            try:
+                return _fin(ndarray_cls._wrap(
+                    arr._array.astype(name), _dtype=name))
+            except Exception:
+                pass
         # bool 目标：数组语义——掩码成 0/1（存原值会使 astype 往返泄漏
         # 原值，与 tolist 的 bool 掩码自相矛盾）
         if name == 'bool':

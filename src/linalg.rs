@@ -3788,6 +3788,50 @@ fn nanarg_core(a: &NdArray, find_min: bool) -> PyResult<usize> {
     best_i.ok_or_else(|| PyValueError::new_err("All-NaN slice encountered"))
 }
 
+/// 实数数组是否含 NaN/inf（复数查双通道）——lstsq 等的非有限快速
+/// 检查（替代 Python 全量 tolist+逐元素扫描）。
+#[pyfunction]
+fn has_nonfinite_core(a: &NdArray) -> PyResult<bool> {
+    Ok(a.data.iter().any(|v| v.is_nan() || v.is_infinite())
+        || a.imag
+            .as_ref()
+            .is_some_and(|im| im.iter().any(|v| v.is_nan() || v.is_infinite())))
+}
+
+/// 1-D/全归约百分位数（语义与 Python _percentile_1d/'linear' 对齐）：
+/// nan_filter=True 过滤 NaN（nanpercentile），False 时 NaN 传染（结果
+/// NaN）；q01∈[0,1]，虚指数 vidx = q01·(n-1)，clamp 后线性插值
+/// （hi 越界取 NaN，同 at()）。n 为原元素数（含被过滤的 NaN）。
+#[pyfunction]
+#[pyo3(signature = (a, q01, nan_filter))]
+fn percentile_core(a: &NdArray, q01: f64, nan_filter: bool) -> PyResult<f64> {
+    let n = a.data.len();
+    if n == 0 {
+        return Err(PyValueError::new_err("empty input"));
+    }
+    let mut vals: Vec<f64> = if nan_filter {
+        a.data.iter().copied().filter(|v| !v.is_nan()).collect()
+    } else {
+        a.data.iter().copied().collect()
+    };
+    // 引擎语义：插值的 n = 过滤后长度（nanpercentile 忽略 NaN 计数）
+    let n = vals.len();
+    if n == 0 {
+        return Err(PyValueError::new_err("empty input"));
+    }
+    // NaN 传染（median/percentile 未过滤时）：任一 NaN → 结果 NaN
+    if !nan_filter && vals.iter().any(|v| v.is_nan()) {
+        return Ok(f64::NAN);
+    }
+    vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let n_f = n as f64;
+    let vidx = (q01 * (n_f - 1.0)).clamp(0.0, n_f - 1.0);
+    let lo = vidx.floor() as usize;
+    let hi = (lo + 1).min(n - 1);
+    let frac = vidx - lo as f64;
+    Ok(vals[lo] + (vals[hi] - vals[lo]) * frac)
+}
+
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dot, m)?)?;
     m.add_function(wrap_pyfunction!(vdot, m)?)?;
@@ -3819,6 +3863,8 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eig_vectors_core, m)?)?;
     m.add_function(wrap_pyfunction!(median_core, m)?)?;
     m.add_function(wrap_pyfunction!(nanarg_core, m)?)?;
+    m.add_function(wrap_pyfunction!(percentile_core, m)?)?;
+    m.add_function(wrap_pyfunction!(has_nonfinite_core, m)?)?;
     m.add_function(wrap_pyfunction!(eigvals_qr_batch_core, m)?)?;
     Ok(())
 }

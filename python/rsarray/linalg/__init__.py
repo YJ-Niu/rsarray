@@ -1358,6 +1358,19 @@ class linalg_module:
         if b_is_1d:
             b_rows = [[v] for v in b_rows]
 
+        # Rust 快速检查：O(n) 内核（无 tolist 往返）；触发 → LinAlgError，
+        # 内核 Err → 原逐元素 Python 扫描兜底
+        try:
+            import rsarray.num_core as _core_sf
+            if (_core_sf.has_nonfinite_core(a_arr)
+                    or _core_sf.has_nonfinite_core(b_arr)):
+                raise LinAlgError(
+                    "Array must not contain infs or NaNs")
+        except LinAlgError:
+            raise
+        except Exception:
+            pass
+
         def _scan_nonfinite(data):
             for row in data:
                 if not isinstance(row, (list, tuple)):
