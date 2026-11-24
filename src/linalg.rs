@@ -3687,11 +3687,14 @@ fn eig_vectors_core(a: &NdArray, evals: &NdArray) -> PyResult<NdArray> {
 }
 
 /// 1-D/全归约中位数（语义与 Python _median_py axis=None 对齐）：
-/// NaN 传染（任一元素 NaN → 结果 NaN）；排序 complex 按 (real, imag)
-/// 字典序（同 _ckey）；奇数取 vs[n/2]，偶数取 (vs[n/2-1]+vs[n/2])/2。
-/// 返回 (1,) complex NdArray（实输入 imag=0）。
+/// nan_filter=False（默认，median）——NaN 传染（任一元素 NaN → 结果
+/// NaN）；nan_filter=True（nanmedian）——过滤 NaN 后取中位，过滤后
+/// 空则 NaN（全 NaN 输入，警告由 Python 侧处理）。排序 complex 按
+/// (real, imag) 字典序（同 _ckey）；奇数取 vs[n/2]，偶数取
+/// (vs[n/2-1]+vs[n/2])/2。返回 (1,) complex NdArray（实输入 imag=0）。
 #[pyfunction]
-fn median_core(a: &NdArray) -> PyResult<NdArray> {
+#[pyo3(signature = (a, nan_filter))]
+fn median_core(a: &NdArray, nan_filter: bool) -> PyResult<NdArray> {
     let n = a.data.len();
     if n == 0 {
         return Err(PyValueError::new_err("empty input"));
@@ -3706,7 +3709,12 @@ fn median_core(a: &NdArray) -> PyResult<NdArray> {
             .map(|(&r, &i)| (r, i))
             .collect(),
     };
-    // NaN 传染：任一元素 NaN → 结果 NaN
+    if nan_filter {
+        vals.retain(|z| !(z.0.is_nan() || z.1.is_nan()));
+    }
+    // 中位索引基于过滤后长度（nanmedian 语义：NaN 不计入）
+    let n = vals.len();
+    // NaN 传染（median，未过滤时）：任一元素 NaN → 结果 NaN
     let nan = vals.iter().any(|z| z.0.is_nan() || z.1.is_nan());
     let r = if nan {
         (f64::NAN, f64::NAN)
@@ -3740,6 +3748,46 @@ fn median_core(a: &NdArray) -> PyResult<NdArray> {
     })
 }
 
+/// 1-D/全归约 nanargmax/nanargmin（语义与 Python nanargmax/nanargmin
+/// 对齐）：忽略 NaN 后按 (real, imag) 字典序（同 _ckey）取最大/最小
+/// 值的原索引（严格比较 → 首个命中）。全 NaN/空 → Err，由 Python
+/// 侧 raise ValueError。
+#[pyfunction]
+#[pyo3(signature = (a, find_min))]
+fn nanarg_core(a: &NdArray, find_min: bool) -> PyResult<usize> {
+    let vals: Vec<(f64, f64)> = match &a.imag {
+        None => a.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => a
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    let mut best_i: Option<usize> = None;
+    let mut best_v = (0.0, 0.0);
+    for (i, &z) in vals.iter().enumerate() {
+        if z.0.is_nan() || z.1.is_nan() {
+            continue;
+        }
+        let take = match best_i {
+            None => true,
+            Some(_) => {
+                if find_min {
+                    z.0 < best_v.0 || (z.0 == best_v.0 && z.1 < best_v.1)
+                } else {
+                    z.0 > best_v.0 || (z.0 == best_v.0 && z.1 > best_v.1)
+                }
+            }
+        };
+        if take {
+            best_i = Some(i);
+            best_v = z;
+        }
+    }
+    best_i.ok_or_else(|| PyValueError::new_err("All-NaN slice encountered"))
+}
+
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dot, m)?)?;
     m.add_function(wrap_pyfunction!(vdot, m)?)?;
@@ -3770,6 +3818,7 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(eig_power_core, m)?)?;
     m.add_function(wrap_pyfunction!(eig_vectors_core, m)?)?;
     m.add_function(wrap_pyfunction!(median_core, m)?)?;
+    m.add_function(wrap_pyfunction!(nanarg_core, m)?)?;
     m.add_function(wrap_pyfunction!(eigvals_qr_batch_core, m)?)?;
     Ok(())
 }
