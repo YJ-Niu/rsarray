@@ -2115,6 +2115,19 @@ fn cdiv_r(z: (f64, f64), r: f64) -> (f64, f64) {
     (z.0 / r, z.1 / r)
 }
 
+/// 复除复（CPython c_quot Smith 算法语义，与 Python complex/complex 位级一致）
+fn cdiv_c(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    if b.1.abs() <= b.0.abs() {
+        let ratio = b.1 / b.0;
+        let den = b.0 + ratio * b.1;
+        ((a.0 + a.1 * ratio) / den, (a.1 - a.0 * ratio) / den)
+    } else {
+        let ratio = b.0 / b.1;
+        let den = b.1 + ratio * b.0;
+        ((a.0 * ratio + a.1) / den, (a.1 * ratio - a.0) / den)
+    }
+}
+
 /// 复乘法（运算次序与 Python complex 一致）
 #[inline]
 fn gj_cmul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
@@ -3441,6 +3454,405 @@ fn eigvals_qr_batch_core(a: &NdArray) -> PyResult<(NdArray, NdArray)> {
     ))
 }
 
+/// 对称/Hermitian 幂迭代特征分解（语义与 Python _eig_power_iteration
+/// 逐条对齐）：对每个 k 从 e_k 起步、至多 100 次幂迭代（norm² < 1e-24
+/// 提前终止）、Rayleigh 商 v^H·A·v 取特征值、特征向量按列存放、无
+/// deflation。输出 evals (n,) 与 evecs (n,n)（complex 双通道）。
+#[pyfunction]
+fn eig_power_core(a: &NdArray) -> PyResult<(NdArray, NdArray)> {
+    let shape: Vec<usize> = a.data.shape().to_vec();
+    if shape.len() != 2 || shape[0] != shape[1] || shape[0] == 0 {
+        return Err(PyValueError::new_err(
+            "eig_power_core: a must be non-empty (n, n)",
+        ));
+    }
+    let n = shape[0];
+    let mat: Vec<(f64, f64)> = match &a.imag {
+        None => a.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => a
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    let matmul = |v: &[(f64, f64)]| -> Vec<(f64, f64)> {
+        (0..n)
+            .map(|i| {
+                let mut acc = (0.0, 0.0);
+                for j in 0..n {
+                    let p = gj_cmul(mat[i * n + j], v[j]);
+                    acc = (acc.0 + p.0, acc.1 + p.1);
+                }
+                acc
+            })
+            .collect()
+    };
+    let mut evals = vec![(0.0, 0.0); n];
+    let mut evecs = vec![(0.0, 0.0); n * n];
+    for k in 0..n {
+        let mut v: Vec<(f64, f64)> = vec![(0.0, 0.0); n];
+        v[k] = (1.0, 0.0);
+        for _ in 0..100 {
+            let new_v = matmul(&v);
+            let norm_sq: f64 = new_v.iter().map(|x| gj_mag(*x).powi(2)).sum();
+            if norm_sq < 1e-24 {
+                break;
+            }
+            let norm = norm_sq.sqrt();
+            v = new_v.iter().map(|x| cdiv_r(*x, norm)).collect();
+        }
+        let mat_v = matmul(&v);
+        let mut lam = (0.0, 0.0);
+        for i in 0..n {
+            let p = cj_mul(v[i], mat_v[i]);
+            lam = (lam.0 + p.0, lam.1 + p.1);
+        }
+        evals[k] = lam;
+        for i in 0..n {
+            evecs[i * n + k] = v[i];
+        }
+    }
+    let evals_re: Vec<f64> = evals.iter().map(|z| z.0).collect();
+    let evals_im: Vec<f64> = evals.iter().map(|z| z.1).collect();
+    let evecs_re: Vec<f64> = evecs.iter().map(|z| z.0).collect();
+    let evecs_im: Vec<f64> = evecs.iter().map(|z| z.1).collect();
+    let evals_arr = Array::from_shape_vec(IxDyn(&[n]), evals_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let evals_im_arr = Array::from_shape_vec(IxDyn(&[n]), evals_im)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let evecs_arr = Array::from_shape_vec(IxDyn(&[n, n]), evecs_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let evecs_im_arr = Array::from_shape_vec(IxDyn(&[n, n]), evecs_im)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((
+        NdArray {
+            data: evals_arr,
+            imag: Some(evals_im_arr),
+        },
+        NdArray {
+            data: evecs_arr,
+            imag: Some(evecs_im_arr),
+        },
+    ))
+}
+
+/// 复数列主元高斯消元（语义与 Python _solve_pivot 逐条对齐）：
+/// 奇异时用最大可用枢轴继续、零枢轴跳过、回代求 x。
+fn solve_pivot_c(a: &[(f64, f64)], b: &[(f64, f64)], n: usize) -> Vec<(f64, f64)> {
+    let mut work = a.to_vec();
+    let mut rhs = b.to_vec();
+    for col in 0..n {
+        let mut p = col;
+        let mut best = gj_mag(work[col * n + col]);
+        for r in col + 1..n {
+            let m = gj_mag(work[r * n + col]);
+            if m > best {
+                best = m;
+                p = r;
+            }
+        }
+        if p != col {
+            // 整行交换（work 是扁平行主序 n×n；Python 交换的是行）
+            for j in 0..n {
+                work.swap(col * n + j, p * n + j);
+            }
+            rhs.swap(col, p);
+        }
+        let pv = work[col * n + col];
+        if pv == (0.0, 0.0) {
+            continue;
+        }
+        for r in col + 1..n {
+            let f = cdiv_c(work[r * n + col], pv);
+            if f != (0.0, 0.0) {
+                for c2 in col..n {
+                    let t = gj_cmul(f, work[col * n + c2]);
+                    let w = work[r * n + c2];
+                    work[r * n + c2] = (w.0 - t.0, w.1 - t.1);
+                }
+                let t = gj_cmul(f, rhs[col]);
+                rhs[r] = (rhs[r].0 - t.0, rhs[r].1 - t.1);
+            }
+        }
+    }
+    let mut x = vec![(0.0, 0.0); n];
+    for r in (0..n).rev() {
+        let pv = work[r * n + r];
+        if pv == (0.0, 0.0) {
+            continue;
+        }
+        let mut s = rhs[r];
+        for c2 in r + 1..n {
+            let t = gj_cmul(work[r * n + c2], x[c2]);
+            s = (s.0 - t.0, s.1 - t.1);
+        }
+        x[r] = cdiv_c(s, pv);
+    }
+    x
+}
+
+/// 通用 n×n 特征向量（语义与 Python _eigenvectors_general 逐条对齐）：
+/// 对每个特征值 λ 构造正规方程 B = (A−λI)^H(A−λI)（B 近奇异，解的
+/// 方向即零空间 = 特征向量），依次以坐标方向 e_t 为右端解 Bv = e_t，
+/// 解范数 > 1e-8 时归一化采用；全失败用 e_0 兜底。evals 顺序与输出
+/// 列一一对应。返回 (n,n) 行主序 evecs（out[i][k] = 第 k 向量第 i 分量）。
+#[pyfunction]
+fn eig_vectors_core(a: &NdArray, evals: &NdArray) -> PyResult<NdArray> {
+    let shape: Vec<usize> = a.data.shape().to_vec();
+    if shape.len() != 2 || shape[0] != shape[1] || shape[0] == 0 {
+        return Err(PyValueError::new_err(
+            "eig_vectors_core: a must be non-empty (n, n)",
+        ));
+    }
+    let n = shape[0];
+    let mat: Vec<(f64, f64)> = match &a.imag {
+        None => a.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => a
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    if evals.data.len() != n {
+        return Err(PyValueError::new_err(
+            "eig_vectors_core: evals length mismatch",
+        ));
+    }
+    let evals_v: Vec<(f64, f64)> = match &evals.imag {
+        None => evals.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => evals
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    let mut out = vec![(0.0, 0.0); n * n];
+    for (k, &lam) in evals_v.iter().enumerate() {
+        // B = (A−λI)^H (A−λI)
+        let mut b_mat = vec![(0.0, 0.0); n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = (0.0, 0.0);
+                for kk in 0..n {
+                    let mut aik = mat[kk * n + i];
+                    if kk == i {
+                        aik = (aik.0 - lam.0, aik.1 - lam.1);
+                    }
+                    let mut akj = mat[kk * n + j];
+                    if kk == j {
+                        akj = (akj.0 - lam.0, akj.1 - lam.1);
+                    }
+                    let p = cj_mul(aik, akj);
+                    s = (s.0 + p.0, s.1 + p.1);
+                }
+                b_mat[i * n + j] = s;
+            }
+        }
+        // 依次以 e_t 为右端解 Bv = e_t，解范数 > 1e-8 采用
+        let mut v: Option<Vec<(f64, f64)>> = None;
+        for t in 0..n {
+            let rhs: Vec<(f64, f64)> = (0..n)
+                .map(|i| if i == t { (1.0, 0.0) } else { (0.0, 0.0) })
+                .collect();
+            let cand = solve_pivot_c(&b_mat, &rhs, n);
+            let nrm_sq: f64 = cand.iter().map(|z| gj_mag(*z).powi(2)).sum();
+            let nrm = nrm_sq.sqrt();
+            if nrm > 1e-8 {
+                v = Some(cand.iter().map(|z| cdiv_r(*z, nrm)).collect());
+                break;
+            }
+        }
+        let v = v.unwrap_or_else(|| {
+            let mut x = vec![(0.0, 0.0); n];
+            x[0] = (1.0, 0.0);
+            x
+        });
+        for i in 0..n {
+            out[i * n + k] = v[i];
+        }
+    }
+    let out_re: Vec<f64> = out.iter().map(|z| z.0).collect();
+    let out_im: Vec<f64> = out.iter().map(|z| z.1).collect();
+    let data = Array::from_shape_vec(IxDyn(&[n, n]), out_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let imag = Array::from_shape_vec(IxDyn(&[n, n]), out_im)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        data,
+        imag: Some(imag),
+    })
+}
+
+/// 1-D/全归约中位数（语义与 Python _median_py axis=None 对齐）：
+/// nan_filter=False（默认，median）——NaN 传染（任一元素 NaN → 结果
+/// NaN）；nan_filter=True（nanmedian）——过滤 NaN 后取中位，过滤后
+/// 空则 NaN（全 NaN 输入，警告由 Python 侧处理）。排序 complex 按
+/// (real, imag) 字典序（同 _ckey）；奇数取 vs[n/2]，偶数取
+/// (vs[n/2-1]+vs[n/2])/2。返回 (1,) complex NdArray（实输入 imag=0）。
+#[pyfunction]
+#[pyo3(signature = (a, nan_filter))]
+fn median_core(a: &NdArray, nan_filter: bool) -> PyResult<NdArray> {
+    let n = a.data.len();
+    if n == 0 {
+        return Err(PyValueError::new_err("empty input"));
+    }
+    let has_imag = a.imag.is_some();
+    let mut vals: Vec<(f64, f64)> = match &a.imag {
+        None => a.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => a
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    if nan_filter {
+        vals.retain(|z| !(z.0.is_nan() || z.1.is_nan()));
+    }
+    // 中位索引基于过滤后长度（nanmedian 语义：NaN 不计入）
+    let n = vals.len();
+    // NaN 传染（median，未过滤时）：任一元素 NaN → 结果 NaN
+    let nan = vals.iter().any(|z| z.0.is_nan() || z.1.is_nan());
+    let r = if nan {
+        (f64::NAN, f64::NAN)
+    } else {
+        if has_imag {
+            // complex 按 (real, imag) 字典序（同 _ckey）
+            vals.sort_by(|x, y| {
+                x.0.partial_cmp(&y.0)
+                    .unwrap()
+                    .then(x.1.partial_cmp(&y.1).unwrap())
+            });
+        } else {
+            vals.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+        }
+        if n % 2 == 1 {
+            vals[n / 2]
+        } else {
+            let x = vals[n / 2 - 1];
+            let y = vals[n / 2];
+            ((x.0 + y.0) / 2.0, (x.1 + y.1) / 2.0)
+        }
+    };
+    let data = Array::from_shape_vec(IxDyn(&[1]), vec![r.0])
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let imag = Array::from_shape_vec(IxDyn(&[1]), vec![r.1])
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    // 实数输入返回实通道（Python 侧 tolist 得 float，不是 complex）
+    Ok(NdArray {
+        data,
+        imag: if has_imag { Some(imag) } else { None },
+    })
+}
+
+/// 1-D/全归约 nanargmax/nanargmin（语义与 Python nanargmax/nanargmin
+/// 对齐）：忽略 NaN 后按 (real, imag) 字典序（同 _ckey）取最大/最小
+/// 值的原索引（严格比较 → 首个命中）。全 NaN/空 → Err，由 Python
+/// 侧 raise ValueError。
+#[pyfunction]
+#[pyo3(signature = (a, find_min))]
+fn nanarg_core(a: &NdArray, find_min: bool) -> PyResult<usize> {
+    let vals: Vec<(f64, f64)> = match &a.imag {
+        None => a.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => a
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    let mut best_i: Option<usize> = None;
+    let mut best_v = (0.0, 0.0);
+    for (i, &z) in vals.iter().enumerate() {
+        if z.0.is_nan() || z.1.is_nan() {
+            continue;
+        }
+        let take = match best_i {
+            None => true,
+            Some(_) => {
+                if find_min {
+                    z.0 < best_v.0 || (z.0 == best_v.0 && z.1 < best_v.1)
+                } else {
+                    z.0 > best_v.0 || (z.0 == best_v.0 && z.1 > best_v.1)
+                }
+            }
+        };
+        if take {
+            best_i = Some(i);
+            best_v = z;
+        }
+    }
+    best_i.ok_or_else(|| PyValueError::new_err("All-NaN slice encountered"))
+}
+
+/// 实数数组是否含 NaN/inf（复数查双通道）——lstsq 等的非有限快速
+/// 检查（替代 Python 全量 tolist+逐元素扫描）。
+#[pyfunction]
+fn has_nonfinite_core(a: &NdArray) -> PyResult<bool> {
+    Ok(a.data.iter().any(|v| v.is_nan() || v.is_infinite())
+        || a.imag
+            .as_ref()
+            .is_some_and(|im| im.iter().any(|v| v.is_nan() || v.is_infinite())))
+}
+
+/// 实数数组 NaN→val 替换（_replace_nan 的 O(n) 内核，替代布尔掩码
+/// setitem 慢路径）。复数输入 → Err（Python 兜底）。
+#[pyfunction]
+#[pyo3(signature = (a, val))]
+fn replace_nan_core(a: &NdArray, val: f64) -> PyResult<NdArray> {
+    if a.imag.is_some() {
+        return Err(PyValueError::new_err("complex input"));
+    }
+    let data: Vec<f64> = a
+        .data
+        .iter()
+        .map(|&v| if v.is_nan() { val } else { v })
+        .collect();
+    let arr = Array::from_shape_vec(IxDyn(a.data.shape()), data)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        data: arr,
+        imag: None,
+    })
+}
+
+/// 1-D/全归约百分位数（语义与 Python _percentile_1d/'linear' 对齐）：
+/// nan_filter=True 过滤 NaN（nanpercentile），False 时 NaN 传染（结果
+/// NaN）；q01∈[0,1]，虚指数 vidx = q01·(n-1)，clamp 后线性插值
+/// （hi 越界取 NaN，同 at()）。n 为原元素数（含被过滤的 NaN）。
+#[pyfunction]
+#[pyo3(signature = (a, q01, nan_filter))]
+fn percentile_core(a: &NdArray, q01: f64, nan_filter: bool) -> PyResult<f64> {
+    let n = a.data.len();
+    if n == 0 {
+        return Err(PyValueError::new_err("empty input"));
+    }
+    let mut vals: Vec<f64> = if nan_filter {
+        a.data.iter().copied().filter(|v| !v.is_nan()).collect()
+    } else {
+        a.data.iter().copied().collect()
+    };
+    // 引擎语义：插值的 n = 过滤后长度（nanpercentile 忽略 NaN 计数）
+    let n = vals.len();
+    if n == 0 {
+        return Err(PyValueError::new_err("empty input"));
+    }
+    // NaN 传染（median/percentile 未过滤时）：任一 NaN → 结果 NaN
+    if !nan_filter && vals.iter().any(|v| v.is_nan()) {
+        return Ok(f64::NAN);
+    }
+    vals.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    let n_f = n as f64;
+    let vidx = (q01 * (n_f - 1.0)).clamp(0.0, n_f - 1.0);
+    let lo = vidx.floor() as usize;
+    let hi = (lo + 1).min(n - 1);
+    let frac = vidx - lo as f64;
+    Ok(vals[lo] + (vals[hi] - vals[lo]) * frac)
+}
+
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dot, m)?)?;
     m.add_function(wrap_pyfunction!(vdot, m)?)?;
@@ -3468,6 +3880,13 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(svd_assemble_core, m)?)?;
     m.add_function(wrap_pyfunction!(qr_householder_core, m)?)?;
     m.add_function(wrap_pyfunction!(eigvals_qr_core, m)?)?;
+    m.add_function(wrap_pyfunction!(eig_power_core, m)?)?;
+    m.add_function(wrap_pyfunction!(eig_vectors_core, m)?)?;
+    m.add_function(wrap_pyfunction!(median_core, m)?)?;
+    m.add_function(wrap_pyfunction!(nanarg_core, m)?)?;
+    m.add_function(wrap_pyfunction!(percentile_core, m)?)?;
+    m.add_function(wrap_pyfunction!(has_nonfinite_core, m)?)?;
+    m.add_function(wrap_pyfunction!(replace_nan_core, m)?)?;
     m.add_function(wrap_pyfunction!(eigvals_qr_batch_core, m)?)?;
     Ok(())
 }

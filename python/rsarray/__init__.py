@@ -8030,8 +8030,21 @@ def _fp_sub_bad(a, other, res):
 
 
 def _fp_check_sub_invalid(a, other, res):
-    """按当前 errstate 处理减法的 invalid 浮点错误事件（数组语义）。"""
-    if _fp_sub_bad(a, other, res):
+    """按当前 errstate 处理减法的 invalid 浮点错误事件（数组语义）。
+
+    实数数组/float 标量走 Rust 快速路径（同 fp_arith_check_core，
+    subtract 分支）；int/bool/complex 输入原语义无触发直接返回。"""
+    d = getattr(a, '_dtype', None)
+    if d is not None and not d.startswith('float'):
+        return
+    try:
+        _, inv, _ = np.fp_arith_check_core(
+            getattr(a, '_array', a),
+            getattr(other, '_array', other),
+            getattr(res, '_array', res), 'subtract')
+    except Exception:
+        return
+    if inv:
         _extra_module._fp_fire('invalid',
                                "invalid value encountered in subtract")
 

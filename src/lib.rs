@@ -1191,8 +1191,10 @@ impl NdArray {
     }
 
     fn astype(&self, dtype: &str) -> PyResult<NdArray> {
-        // rsarray 内部元素类型固定为 f64，这里只支持把 f64 截断为整数（int/int32/int64）。
-        // 对于 float* / 其它类型，保持 f64 行为（与旧版一致）。
+        // 数值转换语义与 Python astype 分支位级对齐：NaN→0、float 向零
+        // 截断、整数按目标位宽补码回绕（uint64 高位回落补码负值）、
+        // bool 0/1、float32 IEEE 舍入。float16 等罕见目标 → Err（Python
+        // 慢路径兜底）。
         let dt = dtype.to_lowercase();
         let is_complex = matches!(
             dt.as_str(),
@@ -1206,34 +1208,105 @@ impl NdArray {
                 .unwrap_or_else(|| Array::zeros(self.data.raw_dim()));
             return Ok(NdArray::from_complex(self.data.clone(), imag));
         }
-        let is_int = matches!(
-            dt.as_str(),
-            "int"
-                | "i"
-                | "int8"
-                | "int16"
-                | "int32"
-                | "int64"
-                | "intp"
-                | "i8"
-                | "i16"
-                | "i32"
-                | "i64"
-        );
-        if is_int {
-            let casted: Vec<f64> = self.data.iter().map(|v| v.trunc()).collect();
-            let arr = Array::from_shape_vec(IxDyn(self.data.shape()), casted)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?;
-            Ok(NdArray {
-                imag: None,
-                data: arr,
-            })
-        } else {
-            // float* 或其它：丢弃虚部（与 astype 到实数类型一致）。
-            Ok(NdArray {
-                imag: None,
-                data: self.data.clone(),
-            })
+        let convert = |v: f64| -> f64 {
+            match dt.as_str() {
+                "bool" => {
+                    if v != 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                "int8" | "i8" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        ((v.trunc().rem_euclid(256.0) as u64 & 0xFF) as u8) as i8 as f64
+                    }
+                }
+                "int16" | "i16" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        ((v.trunc().rem_euclid(65536.0) as u64 & 0xFFFF) as u16) as i16 as f64
+                    }
+                }
+                "int32" | "i32" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        ((v.trunc().rem_euclid(4294967296.0) as u64 & 0xFFFFFFFF) as u32) as i32
+                            as f64
+                    }
+                }
+                "int64" | "intp" | "i64" | "int" | "i" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        v.trunc().rem_euclid(18446744073709551616.0) as u64 as i64 as f64
+                    }
+                }
+                "uint8" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        v.trunc().rem_euclid(256.0)
+                    }
+                }
+                "uint16" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        v.trunc().rem_euclid(65536.0)
+                    }
+                }
+                "uint32" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        v.trunc().rem_euclid(4294967296.0)
+                    }
+                }
+                "uint64" => {
+                    if v.is_nan() {
+                        0.0
+                    } else {
+                        // uint64 高位（≥2^63）回落补码负值（Python 同款）
+                        v.trunc().rem_euclid(18446744073709551616.0) as u64 as i64 as f64
+                    }
+                }
+                "float32" => {
+                    if v.is_nan() || v.abs() >= 3.4028235e38 {
+                        v
+                    } else {
+                        v as f32 as f64
+                    }
+                }
+                _ => v,
+            }
+        };
+        match dt.as_str() {
+            "float64" | "float" | "f64" | "f8" | "f" => {
+                // float64 目标：丢弃虚部（与 astype 到实数类型一致）
+                Ok(NdArray {
+                    imag: None,
+                    data: self.data.clone(),
+                })
+            }
+            "bool" | "int8" | "i8" | "int16" | "i16" | "int32" | "i32" | "int64" | "i64"
+            | "intp" | "int" | "i" | "uint8" | "uint16" | "uint32" | "uint64" | "float32" => {
+                let casted: Vec<f64> = self.data.iter().map(|&v| convert(v)).collect();
+                let arr = Array::from_shape_vec(IxDyn(self.data.shape()), casted)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Ok(NdArray {
+                    imag: None,
+                    data: arr,
+                })
+            }
+            _ => {
+                // float16 等罕见目标：Err 由 Python 慢路径兜底
+                Err(PyValueError::new_err("unsupported astype target"))
+            }
         }
     }
 
@@ -2979,6 +3052,293 @@ fn build_array_interface<'py>(
     Ok(dict)
 }
 
+enum FpSrc<'a> {
+    Arr(std::borrow::Cow<'a, [f64]>),
+    Sc(f64),
+}
+
+fn fp_parse<'a>(x: &'a Bound<'a, PyAny>) -> PyResult<FpSrc<'a>> {
+    if let Ok(arr) = x.cast::<NdArray>() {
+        let a = arr.borrow();
+        if a.imag.is_some() {
+            return Err(PyValueError::new_err("complex input"));
+        }
+        // 物化拷贝：借用链跨 PyRef 生命周期证明复杂，单次 O(n) 拷贝可忽略
+        return Ok(FpSrc::Arr(std::borrow::Cow::Owned(
+            a.data.iter().copied().collect(),
+        )));
+    }
+    if let Ok(s) = x.extract::<f64>() {
+        return Ok(FpSrc::Sc(s));
+    }
+    Err(PyValueError::new_err("unsupported input"))
+}
+
+fn fp_normalize(s: FpSrc<'_>) -> FpSrc<'_> {
+    // 长度 1 数组等效标量广播（同 Python 的 na = na * len(nb)）
+    match s {
+        FpSrc::Arr(d) if d.len() == 1 => FpSrc::Sc(d[0]),
+        other => other,
+    }
+}
+
+fn fp_get(s: &FpSrc<'_>, i: usize) -> f64 {
+    match s {
+        FpSrc::Arr(d) => d.get(i).copied().unwrap_or(0.0),
+        FpSrc::Sc(v) => *v,
+    }
+}
+
+fn fp_len(s: &FpSrc<'_>) -> usize {
+    match s {
+        FpSrc::Arr(d) => d.len(),
+        FpSrc::Sc(_) => 1,
+    }
+}
+
+/// add/subtract/multiply 的 errstate 触发快速路径（语义与 Python
+/// _fp_arith_check 逐条对齐）：overflow（有限输入 → ±inf，multiply
+/// 含 0×有限 → inf；add/subtract 同号/反号溢出且输入有限）、
+/// invalid（结果 nan：inf-inf / inf+(-inf) / 0×inf）、underflow
+/// （multiply：有限非零输入 → 0 或次正规）。实数 NdArray/float
+/// 标量输入；复数组/int 输入原逻辑逐元素跳过（等效无触发），由
+/// Python 侧先行拦截。返回 (ov, inv, un) 触发标记。
+#[pyfunction]
+fn fp_arith_check_core(
+    num: &Bound<'_, PyAny>,
+    oth: &Bound<'_, PyAny>,
+    res: &Bound<'_, PyAny>,
+    op: &str,
+) -> PyResult<(bool, bool, bool)> {
+    let sn = fp_normalize(fp_parse(num)?);
+    let so = fp_normalize(fp_parse(oth)?);
+    let sr = fp_normalize(fp_parse(res)?);
+    let n = fp_len(&sn).min(fp_len(&so));
+    let mut ov_f = false;
+    let mut inv_f = false;
+    let mut un_f = false;
+    let tiny = 2.2250738585072014e-308f64;
+    for i in 0..n {
+        let a = fp_get(&sn, i);
+        let b = fp_get(&so, i);
+        let r = fp_get(&sr, i);
+        let ai = a.is_infinite();
+        let bi = b.is_infinite();
+        let ri = r.is_infinite();
+        if op == "multiply" {
+            if ri && !(ai || bi) && a != 0.0 && b != 0.0 {
+                ov_f = true;
+            } else if r.is_nan() || (ri && (ai || bi) && (a == 0.0 || b == 0.0)) {
+                inv_f = true;
+            } else if !ai
+                && !bi
+                && a != 0.0
+                && b != 0.0
+                && !r.is_nan()
+                && (r == 0.0 || r.abs() < tiny)
+            {
+                un_f = true;
+            }
+        } else if op == "divide" {
+            // 语义同 Python _fp_divide_check：分母无零 → 无触发；
+            // 否则按结果顺序首个 inf → divide、首个 nan → invalid
+            //（命中即停，与 Python 的 fire-and-return 一致）
+            let mut den_has_zero = false;
+            for i in 0..fp_len(&so) {
+                if fp_get(&so, i) == 0.0 {
+                    den_has_zero = true;
+                    break;
+                }
+            }
+            if !den_has_zero {
+                return Ok((false, false, false));
+            }
+            for i in 0..fp_len(&sr) {
+                let r = fp_get(&sr, i);
+                if r.is_infinite() {
+                    ov_f = true;
+                    break;
+                }
+                if r.is_nan() {
+                    inv_f = true;
+                    break;
+                }
+            }
+        } else {
+            let ov = if op == "add" {
+                (a > 0.0 && b > 0.0 && ri && r > 0.0) || (a < 0.0 && b < 0.0 && ri && r < 0.0)
+            } else {
+                (a > 0.0 && b < 0.0 && ri && r > 0.0) || (a < 0.0 && b > 0.0 && ri && r < 0.0)
+            };
+            if ov && !(ai || bi) {
+                ov_f = true;
+            }
+            if ai && bi && r.is_nan() {
+                inv_f = true;
+            }
+        }
+    }
+    Ok((ov_f, inv_f, un_f))
+}
+
+/// 1-D 数值 unique（排序法 O(n log n)）：语义与 array_ops.unique 的
+/// axis=None 主路径对齐——稳定排序（相等元素保原序；NaN 视为最大排
+/// 最后，组内按原序；-0.0 与 0.0 视为相等）、相邻合并（equal_nan=True
+/// 时全部 NaN 归一，False 时各 NaN 独立）、值保留首次出现者
+/// （稳定排序保证组首即原序最先出现）。want_sorted=False 时输出按
+/// 首次出现序重排。返回 (values, first, inverse, counts)。
+/// 复数/空数组 → Err，由 Python 侧回退原路径。
+#[pyfunction]
+#[pyo3(signature = (a, equal_nan, want_sorted))]
+fn unique_1d_core(
+    a: &NdArray,
+    equal_nan: bool,
+    want_sorted: bool,
+) -> PyResult<(NdArray, NdArray, NdArray, NdArray)> {
+    if a.imag.is_some() {
+        return Err(PyValueError::new_err("complex input"));
+    }
+    let n = a.data.len();
+    if n == 0 {
+        return Err(PyValueError::new_err("empty input"));
+    }
+    let data: Vec<f64> = a.data.iter().copied().collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&p, &q| {
+        let (x, y) = (data[p], data[q]);
+        match (x.is_nan(), y.is_nan()) {
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            // NaN 组内按原序（稳定）；-0.0 与 0.0 相等（partial_cmp）
+            (true, true) => std::cmp::Ordering::Equal,
+            _ => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        }
+    });
+    struct G {
+        v: f64,
+        first: usize,
+        cnt: usize,
+    }
+    let mut groups: Vec<G> = Vec::new();
+    let mut inv = vec![0usize; n];
+    for &p in order.iter() {
+        let v = data[p];
+        if let Some(g) = groups.last_mut() {
+            let eq = g.v == v || (equal_nan && g.v.is_nan() && v.is_nan());
+            if eq {
+                g.cnt += 1;
+                inv[p] = groups.len() - 1;
+                continue;
+            }
+        }
+        inv[p] = groups.len();
+        groups.push(G {
+            v,
+            first: p,
+            cnt: 1,
+        });
+    }
+    let k = groups.len();
+    let mut vals_v: Vec<f64> = Vec::with_capacity(k);
+    let mut first_v: Vec<f64> = Vec::with_capacity(k);
+    let mut cnt_v: Vec<f64> = Vec::with_capacity(k);
+    for g in groups.iter() {
+        vals_v.push(g.v);
+        first_v.push(g.first as f64);
+        cnt_v.push(g.cnt as f64);
+    }
+    if !want_sorted {
+        // 首次出现序重排：组按 first 升序，inverse 同步重映射
+        let mut order2: Vec<usize> = (0..k).collect();
+        order2.sort_by_key(|&gi| groups[gi].first);
+        let mut pos = vec![0usize; k];
+        let mut v2 = vec![0.0f64; k];
+        let mut f2 = vec![0.0f64; k];
+        let mut c2 = vec![0.0f64; k];
+        for (new, old) in order2.iter().enumerate() {
+            pos[*old] = new;
+            v2[new] = vals_v[*old];
+            f2[new] = first_v[*old];
+            c2[new] = cnt_v[*old];
+        }
+        for i in 0..n {
+            inv[i] = pos[inv[i]];
+        }
+        vals_v = v2;
+        first_v = f2;
+        cnt_v = c2;
+    }
+    let to_arr = |v: Vec<f64>| -> PyResult<NdArray> {
+        let arr = Array::from_shape_vec(IxDyn(&[v.len()]), v)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(NdArray {
+            data: arr,
+            imag: None,
+        })
+    };
+    Ok((
+        to_arr(vals_v)?,
+        to_arr(first_v)?,
+        to_arr(inv.iter().map(|&i| i as f64).collect())?,
+        to_arr(cnt_v)?,
+    ))
+}
+
+/// 实数数组是否含 NaN（复数组查 real/imag 双通道）。Python 侧
+/// _has_nan_arr 等全量展平检查（tolist+any）的 O(n) Rust 替代。
+#[pyfunction]
+fn has_nan_core(a: &NdArray) -> PyResult<bool> {
+    Ok(a.data.iter().any(|v| v.is_nan())
+        || a.imag
+            .as_ref()
+            .is_some_and(|im| im.iter().any(|v| v.is_nan())))
+}
+
+/// 实数数组是否全为 NaN（复数组查 real/imag 双通道）——nan 聚合的
+/// all-NaN 警告语义（"Mean of empty slice"/"All-NaN slice"）判定。
+#[pyfunction]
+fn all_nan_core(a: &NdArray) -> PyResult<bool> {
+    Ok(a.data.iter().all(|v| v.is_nan())
+        && a.imag
+            .as_ref()
+            .map(|im| im.iter().all(|v| v.is_nan()))
+            .unwrap_or(true))
+}
+
+/// 实数数组是否含负值（sqrt 的 invalid 触发检查）。复数输入恒 False
+/// （复数 sqrt 无 invalid 语义）。
+#[pyfunction]
+fn has_negative_core(a: &NdArray) -> PyResult<bool> {
+    if a.imag.is_some() {
+        return Ok(false);
+    }
+    Ok(a.data.iter().any(|&v| v < 0.0))
+}
+
+/// 数组舍入（Python round half-even 语义）：rint(x·10^d)/10^d
+/// （d<0 时 rint(x/10^-d)·10^-d）。与 math_functions.around 的
+/// _rnd（builtins.round half-even）位级一致。
+#[pyfunction]
+#[pyo3(signature = (a, decimals))]
+fn round_core(a: &NdArray, decimals: i32) -> PyResult<NdArray> {
+    let data: Vec<f64> = a
+        .data
+        .iter()
+        .map(|&v| {
+            if decimals >= 0 {
+                let f = 10f64.powi(decimals);
+                (v * f).round_ties_even() / f
+            } else {
+                let f = 10f64.powi(-decimals);
+                (v / f).round_ties_even() * f
+            }
+        })
+        .collect();
+    let data = Array::from_shape_vec(a.data.shape(), data)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray { data, imag: None })
+}
+
 #[pymodule]
 fn num_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NdArray>()?;
@@ -3010,6 +3370,12 @@ fn num_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fft::py_ifft_ndarray, m)?)?;
     m.add_function(wrap_pyfunction!(fft::py_rfft_ndarray, m)?)?;
     m.add_function(wrap_pyfunction!(fft::py_irfft_ndarray, m)?)?;
+    m.add_function(wrap_pyfunction!(fp_arith_check_core, m)?)?;
+    m.add_function(wrap_pyfunction!(unique_1d_core, m)?)?;
+    m.add_function(wrap_pyfunction!(has_nan_core, m)?)?;
+    m.add_function(wrap_pyfunction!(all_nan_core, m)?)?;
+    m.add_function(wrap_pyfunction!(has_negative_core, m)?)?;
+    m.add_function(wrap_pyfunction!(round_core, m)?)?;
 
     let random_module = PyModule::new(m.py(), "random")?;
     random::init_module(&random_module)?;

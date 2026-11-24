@@ -172,16 +172,12 @@ def _ckey(v):
 
 
 def _has_nan_arr(a):
-    """数组是否含 NaN（int/bool 恒 False）。"""
+    """数组是否含 NaN（int/bool 恒 False；Rust 内核 O(n) 快速检查）。"""
     k = _dt_kind(getattr(a, '_dtype', None))
     if k not in 'fc':
         return False
-    rs = _rs()
-    v = rs.isnan(a).any()
-    try:
-        return bool(v)
-    except Exception:
-        return bool(v.tolist() if hasattr(v, 'tolist') else v)
+    import rsarray.num_core as _core
+    return _core.has_nan_core(a._array)
 
 
 # ------------------------------------------------------------------ 归约引擎
@@ -625,6 +621,15 @@ def _replace_nan(a, val):
         mask = rs.not_equal(a, a)
     elif k in 'fc':
         mask = rs.isnan(a)
+        # 实数：Rust 替换内核（O(n)，替代布尔掩码 setitem 慢路径）；
+        # 复数走原掩码 setitem
+        if k == 'f':
+            try:
+                import rsarray.num_core as _core_rn
+                return _core_rn.linalg.replace_nan_core(
+                    a._array, float(val)), mask
+            except Exception:
+                pass
     else:
         return a, None
     if len(tuple(a.shape)) == 0:
@@ -792,7 +797,13 @@ def _reduce_wrap(results, axes, shape, keepdims, dtype, out, src):
 
 
 def _simple_fast(a, axis, out):
-    """Rust 快路径条件：ndarray（非子类）、axis None/int、ndim>=1、无 NaN、无 out。"""
+    """Rust 快路径条件：ndarray（非子类）、axis None/int、ndim>=1、无 out。
+
+    NaN 策略：Rust 归约的值语义与 Python 一致（nansum=0/nanprod=1/
+    nanmean=nanmin=nanmax=nan），仅 all-NaN slice 的 RuntimeWarning 在
+    快路径上不触发——因此只拦截会触发警告的场景（全 NaN 数组 +
+    axis=None；axis 归约含 NaN 时无法廉价判定是否存在全 NaN slice，
+    保守拦截），其余含 NaN 输入放行快路径。"""
     rs = _rs()
     if out is not None or type(a) is not rs.ndarray:
         return False
@@ -807,7 +818,15 @@ def _simple_fast(a, axis, out):
     if not (axis is None or isinstance(axis, int)):
         return False
     if _has_nan_arr(a):
-        return False
+        if axis is not None:
+            # axis 归约：仅当存在"全 NaN 归约组"（触发 all-NaN 警告）
+            # 才走慢路径，否则 Rust 值语义一致放行
+            import rsarray.num_core as _core
+            if _core.nan_groups_allnan(a._array, axis):
+                return False
+        import rsarray.num_core as _core
+        if _core.all_nan_core(a._array):
+            return False
     return True
 
 
@@ -1179,6 +1198,18 @@ def nanargmax(a, axis=None, out=None, keepdims=False):
         return _obj_delegate(a, 'argmax', axis=axis, out=out, keepdims=keepdims)
     nd = len(shape)
     axes = _reduce_axes(axis, nd)
+    # axis=None 数值 dtype：Rust 内核（跳过 tolist/Python 逐元素扫描）；
+    # 全 NaN/空 → 内核 Err 回退原路径（原路径 raise ValueError）
+    if axis is None and len(shape) >= 1:
+        _k = _dt_kind(getattr(a, '_dtype', 'float64'))
+        if _k in 'efc':
+            try:
+                import rsarray.num_core as _core_med
+                _i = _core_med.linalg.nanarg_core(a._array, False)
+                return _reduce_wrap([_i], axes, shape, keepdims,
+                                    'int64', out, a)
+            except Exception:
+                pass
     flat = _flat_list(a.tolist())
     results = []
     n_empty = 0
@@ -1217,6 +1248,18 @@ def nanargmin(a, axis=None, out=None, keepdims=False):
         return _obj_delegate(a, 'argmin', axis=axis, out=out, keepdims=keepdims)
     nd = len(shape)
     axes = _reduce_axes(axis, nd)
+    # axis=None 数值 dtype：Rust 内核（跳过 tolist/Python 逐元素扫描）；
+    # 全 NaN/空 → 内核 Err 回退原路径（原路径 raise ValueError）
+    if axis is None and len(shape) >= 1:
+        _k = _dt_kind(getattr(a, '_dtype', 'float64'))
+        if _k in 'efc':
+            try:
+                import rsarray.num_core as _core_med
+                _i = _core_med.linalg.nanarg_core(a._array, True)
+                return _reduce_wrap([_i], axes, shape, keepdims,
+                                    'int64', out, a)
+            except Exception:
+                pass
     flat = _flat_list(a.tolist())
     results = []
     n_empty = 0
@@ -1260,9 +1303,20 @@ def nanmedian(a, axis=None, out=None, overwrite_input=False, keepdims=False):
     #（int 输入 0-d 也转 float64，与 _median_py 的 res_dt 规则对齐）
     res_dt = (dt if k in 'efc' else 'float64') if len(shape) == 0 \
         else _reduction_dtype('median', dt)
-    if _simple_fast(a, axis, out):
-        from rsarray import statistics as _st
-        return _st.median(a, axis=axis, out=out, keepdims=keepdims)
+    # Rust 快路径：axis=None 数值 dtype + nan_filter（过滤 NaN 取中位）。
+    # 全 NaN 数组触发 all-NaN 警告语义 → 保留慢路径。
+    # 注意不能用 _simple_fast——第十九轮放宽后它对含 NaN 输入也返回
+    # True，而 _st.median 是 NaN 传染版，与 nanmedian 的忽略语义冲突。
+    if axis is None and k in 'efc' and len(shape) >= 1:
+        try:
+            import rsarray.num_core as _core_med
+            if not _core_med.all_nan_core(a._array):
+                results = _core_med.linalg.median_core(
+                    a._array, True).tolist()
+                return _reduce_wrap(results, (0,), shape, keepdims,
+                                    res_dt, out, a)
+        except Exception:
+            pass
     results, axes, n_empty, n_allnan, _ = _nan_slice_reduce(a, axis, _py_median)
     if n_allnan:
         for _ in range(n_allnan):
@@ -1428,6 +1482,21 @@ def _percentile_public(a, q, axis, out, overwrite_input, method, keepdims,
         return _percentile_engine(a, q, axis, keepdims, 'int64', out=out,
                                   weights=weights, method=m, nan_filter=nan_filter,
                                   scale=scale, sentinel=_INT64_MIN, relabel=m8s)
+    # 常见路径快车道：实数 + linear + 标量 q + axis=None + 无 weights
+    # （Rust 排序 + linear 虚指数插值；NaN 过滤/传染语义与引擎一致）
+    if (k in 'ef' and m == 'linear' and axis is None and weights is None
+            and not isinstance(q, (list, tuple))
+            and not hasattr(q, 'ndim')
+            and not isinstance(q, _frac_type())):
+        try:
+            import rsarray.num_core as _core_pe
+            _pv = _core_pe.linalg.percentile_core(
+                a._array, float(q) / scale, bool(nan_filter))
+            _res_dt = _dtype_name(dt)
+            return _reduce_wrap([_pv], (0,), tuple(a.shape), keepdims,
+                                _res_dt, out, a)
+        except Exception:
+            pass
     qvals, promote, exact01, qarr = _q_values(q, scale)
     if isinstance(q, (list, tuple)):
         q_shape = _list_shape(q) or (len(qvals),)
@@ -1529,6 +1598,17 @@ def _median_py(a, axis, out, keepdims):
     shape = tuple(a.shape)
     nd = len(shape)
     axes = _reduce_axes(axis, nd)
+    # axis=None（或全归约）+ 数值 dtype：Rust 内核（跳过 tolist/Python
+    # 排序全链）；NaN 传染语义与空数组由内核 Err 回退。必须在 tolist 前。
+    if not _m8_label_of(dt) and k in 'efc' and set(axes) == set(range(nd)):
+        try:
+            import rsarray.num_core as _core_med
+            results = _core_med.linalg.median_core(a._array, False).tolist()
+        except Exception:
+            results = None
+        if results is not None:
+            res_dt = _dtype_name(dt) if k in 'efc' else 'float64'
+            return _reduce_wrap(results, axes, shape, keepdims, res_dt, out, a)
     flat = _flat_list(a.tolist())
     m8s = _m8_label_of(dt)
     sentinel = _INT64_MIN if m8s else None

@@ -62,3 +62,5 @@ tests/all_report.log
 .venv
 .env
 .env.local
+tests/test_config.txt
+.atomcode/memory.md

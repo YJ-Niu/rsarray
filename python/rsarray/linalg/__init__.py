@@ -273,7 +273,7 @@ def _pinv_general(mat):
     return _matmul_2d(v_inv, _matmul_2d(v_inv, at))
 
 
-def _eig_general(mat):
+def _eig_general(mat, arr=None):
     """通用特征值分解实现，支持复数矩阵。"""
     n = len(mat)
     if n == 1:
@@ -308,6 +308,16 @@ def _eig_general(mat):
         return _eig_power_iteration(mat)
     from ._pylinalg import _eigvals_qr, _eigenvectors_general
     evals = _eigvals_qr(mat)
+    # 特征向量 Rust 快路径（原始数组传入时）：消除 O(n⁴) Python 正规
+    # 方程 + 消元；失败回退纯 Python 版本
+    if arr is not None and hasattr(arr, '_array'):
+        try:
+            from rsarray import ndarray as _ndarr
+            ev_arr = _ndarr(list(evals), _dtype='complex128')._array
+            raw = _core.linalg.eig_vectors_core(arr._array, ev_arr)
+            return evals, _ndarr._wrap(raw).tolist()
+        except Exception:
+            pass
     return evals, _eigenvectors_general(mat, evals)
 
 
@@ -358,13 +368,22 @@ def _eig_one(mat):
     from rsarray import ndarray as _nd
 
     dt = getattr(mat, '_dtype', 'float64')
-    if dt in ('complex64', 'complex128'):
-        return _eig_general(mat.tolist())
-    try:
-        ev, ec = _core.linalg.eig(mat._array)
-        return (_nd._wrap(ev).tolist(), _nd._wrap(ec).tolist())
-    except ValueError:
-        return _eig_general(mat.tolist())
+    if dt not in ('complex64', 'complex128'):
+        try:
+            ev, ec = _core.linalg.eig(mat._array)
+            return (_nd._wrap(ev).tolist(), _nd._wrap(ec).tolist())
+        except ValueError:
+            pass
+    m = mat.tolist()
+    # 对称/Hermitian：幂迭代 Rust 内核（消除 O(n⁴) Python 逐元素迭代）；
+    # 失败回退纯 Python 版本
+    if _is_symmetricish(m):
+        try:
+            ev, ec = _core.linalg.eig_power_core(mat._array)
+            return (_nd._wrap(ev).tolist(), _nd._wrap(ec).tolist())
+        except Exception:
+            pass
+    return _eig_general(m, mat)
 
 
 def _gauss_jordan_solve(mat, b):
@@ -1338,6 +1357,19 @@ class linalg_module:
         b_rows = b_arr.tolist()
         if b_is_1d:
             b_rows = [[v] for v in b_rows]
+
+        # Rust 快速检查：O(n) 内核（无 tolist 往返）；触发 → LinAlgError，
+        # 内核 Err → 原逐元素 Python 扫描兜底
+        try:
+            import rsarray.num_core as _core_sf
+            if (_core_sf.has_nonfinite_core(a_arr)
+                    or _core_sf.has_nonfinite_core(b_arr)):
+                raise LinAlgError(
+                    "Array must not contain infs or NaNs")
+        except LinAlgError:
+            raise
+        except Exception:
+            pass
 
         def _scan_nonfinite(data):
             for row in data:

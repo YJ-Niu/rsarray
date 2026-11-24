@@ -1118,6 +1118,160 @@ fn axis_reduce_layout(
     }
 }
 
+/// 沿 axis 归约时是否存在"全 NaN"归约组（nan 聚合 all-NaN 警告语义
+/// 判定）。axis=None 时等价 all_nan（整个数组为一组）。复数查双通道。
+#[pyfunction]
+#[pyo3(signature = (x, axis))]
+fn nan_groups_allnan(x: &NdArray, axis: Option<isize>) -> PyResult<bool> {
+    let shape = x.data.shape().to_vec();
+    let (outer, dim_size, inner, _rs) = axis_reduce_layout(&shape, axis, false)?;
+    let data: Vec<f64> = x.data.iter().copied().collect();
+    let imag: Option<Vec<f64>> = x.imag.as_ref().map(|im| im.iter().copied().collect());
+    let is_nan = |i: usize| -> bool {
+        match &imag {
+            None => data[i].is_nan(),
+            Some(im) => data[i].is_nan() || (i < im.len() && im[i].is_nan()),
+        }
+    };
+    for out_o in 0..outer {
+        for inn in 0..inner {
+            let base = out_o * dim_size * inner;
+            let mut group_all_nan = true;
+            for i in 0..dim_size {
+                if !is_nan(base + i * inner + inn) {
+                    group_all_nan = false;
+                    break;
+                }
+            }
+            if group_all_nan {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Vandermonde 矩阵构造（polyfit）：rows[i][d] = x[i]^d·√w[i]
+/// （w=None 时 √w=1；逐次累乘 p *= xv，幂次 0..=order）。实数输入；
+/// 复数 → Err（Python 复数路径兜底）。输出 (n, order+1)。
+#[pyfunction]
+#[pyo3(signature = (x, order, w))]
+fn polyfit_rows_core(x: &NdArray, order: usize, w: Option<NdArray>) -> PyResult<NdArray> {
+    if x.imag.is_some() {
+        return Err(PyValueError::new_err("complex input"));
+    }
+    let n = x.data.len();
+    if n == 0 {
+        return Err(PyValueError::new_err("empty input"));
+    }
+    let xw: Vec<f64> = x.data.iter().copied().collect();
+    let wv: Option<Vec<f64>> = w
+        .as_ref()
+        .map(|wa| wa.data.iter().map(|&v| v.sqrt()).collect());
+    let mut out = vec![0.0f64; n * (order + 1)];
+    for i in 0..n {
+        let xv = xw[i];
+        let sw = match &wv {
+            None => 1.0,
+            Some(wl) => {
+                let s = wl[i];
+                (s * s).sqrt()
+            }
+        };
+        let mut p = 1.0f64;
+        for d in 0..=order {
+            out[i * (order + 1) + d] = p * sw;
+            p *= xv;
+        }
+    }
+    let arr = Array::from_shape_vec(IxDyn(&[n, order + 1]), out)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        data: arr,
+        imag: None,
+    })
+}
+
+/// polyfit 正规方程快路径（n ≫ d）：G = LᵀL (d×d) + z = Lᵀr，Cholesky
+/// 解 c（O(n·d²) 单遍替代多 sweep SVD）。lhs 为缩放后 (n, d) 实数矩阵；
+/// G 非正定（秩亏/病态）→ Err 回退 SVD 路径（保留 numpy rank 语义）。
+#[pyfunction]
+#[pyo3(signature = (lhs, rhs))]
+fn polyfit_normal_core(lhs: &NdArray, rhs: &NdArray) -> PyResult<NdArray> {
+    if lhs.imag.is_some() || rhs.imag.is_some() {
+        return Err(PyValueError::new_err("complex input"));
+    }
+    let shape = lhs.data.shape().to_vec();
+    if shape.len() != 2 {
+        return Err(PyValueError::new_err("lhs must be 2-D"));
+    }
+    let (n, d) = (shape[0], shape[1]);
+    if rhs.data.len() != n {
+        return Err(PyValueError::new_err("shape mismatch"));
+    }
+    let lf = lhs.data.iter().copied().collect::<Vec<f64>>();
+    let rf = rhs.data.iter().copied().collect::<Vec<f64>>();
+    // G = LᵀL（d×d 对称）
+    let mut g = vec![0.0f64; d * d];
+    for i in 0..n {
+        let li = &lf[i * d..(i + 1) * d];
+        for a in 0..d {
+            for b in 0..d {
+                g[a * d + b] += li[a] * li[b];
+            }
+        }
+    }
+    // z = Lᵀr
+    let mut z = vec![0.0f64; d];
+    for i in 0..n {
+        let li = &lf[i * d..(i + 1) * d];
+        let rv = rf[i];
+        for a in 0..d {
+            z[a] += li[a] * rv;
+        }
+    }
+    // Cholesky：L Lᵀ = G（非正定 → Err）
+    let mut l = vec![0.0f64; d * d];
+    for i in 0..d {
+        for j in 0..=i {
+            let mut s = g[i * d + j];
+            for k in 0..j {
+                s -= l[i * d + k] * l[j * d + k];
+            }
+            if i == j {
+                if s <= 0.0 || !s.is_finite() {
+                    return Err(PyValueError::new_err("not positive definite"));
+                }
+                l[i * d + i] = s.sqrt();
+            } else {
+                l[i * d + j] = s / l[j * d + j];
+            }
+        }
+    }
+    // 前代 + 回代解 c
+    let mut cc = vec![0.0f64; d];
+    for i in 0..d {
+        let mut s = z[i];
+        for k in 0..i {
+            s -= l[i * d + k] * cc[k];
+        }
+        cc[i] = s / l[i * d + i];
+    }
+    for i in (0..d).rev() {
+        let mut s = cc[i];
+        for k in (i + 1)..d {
+            s -= l[k * d + i] * cc[k];
+        }
+        cc[i] = s / l[i * d + i];
+    }
+    let arr =
+        Array::from_shape_vec(IxDyn(&[d]), cc).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        data: arr,
+        imag: None,
+    })
+}
+
 /// 沿轴求和（NaN 视为 0）。
 #[pyfunction]
 #[pyo3(signature = (x, axis=None, keepdims=false))]
@@ -1745,6 +1899,9 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(trim_zeros, m)?)?;
     m.add_function(wrap_pyfunction!(bincount_weighted, m)?)?;
     m.add_function(wrap_pyfunction!(nansum, m)?)?;
+    m.add_function(wrap_pyfunction!(polyfit_rows_core, m)?)?;
+    m.add_function(wrap_pyfunction!(polyfit_normal_core, m)?)?;
+    m.add_function(wrap_pyfunction!(nan_groups_allnan, m)?)?;
     m.add_function(wrap_pyfunction!(nanprod, m)?)?;
     m.add_function(wrap_pyfunction!(nanmax, m)?)?;
     m.add_function(wrap_pyfunction!(nanmin, m)?)?;

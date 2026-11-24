@@ -262,10 +262,13 @@ if [[ "$INSTALLED" -eq 1 && "${SKIP_TESTS:-0}" != "1" ]]; then
 '
 
   # 全部候选文件（排除 __pycache__ 与上面刚门禁通过的核心 7 文件，避免跑两遍）。
+  # 两类：test_*.py 用 pytest 收集运行；verify_*.py（逐轮回归脚本）用 Python
+  # 直接运行（自带 main + sys.exit 退出码）。run_test.py 属冒烟测试不重复跑。
   CANDIDATES=()
   while IFS= read -r _cf; do
     CANDIDATES+=("$_cf")
-  done < <(find tests -name 'test_*.py' -not -path '*/__pycache__/*' | sort)
+  done < <(find tests \( -name 'test_*.py' -o -name 'verify_*.py' \) \
+    -not -name 'run_test.py' -not -path '*/__pycache__/*' | sort)
   RUN_CANDIDATES=()
   for _cf in "${CANDIDATES[@]}"; do
     _skip=0
@@ -365,6 +368,31 @@ PYEOF
         JFLAGS=""
       fi
       echo "  [$_idx/$_N] $f"
+      # verify_*.py（逐轮回归脚本）：Python 直接运行（自带 main + sys.exit），
+      # rc=0 全过；输出末行 "N passed, M failed" 解析计数回写清单。
+      if [[ "$f" == *verify_* ]]; then
+        set +e
+        PYTHONPATH=python PYTHONUNBUFFERED=1 \
+          "$VENV_PY" "$f" 2>&1 | tee -a "$COMPAT_LOG" > "$RUN_DIR/out.log"
+        rc=${PIPESTATUS[0]}
+        set -e
+        _counts=$("$VENV_PY" - "$RUN_DIR/out.log" <<'PYEOF'
+import re, sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+m = re.search(r"(\d+) passed, (\d+) failed", text)
+print(m.group(1) + "/" + m.group(2) + "/0" if m else "0/0/0")
+PYEOF
+)
+        _flag=0
+        if [[ $rc -eq 0 ]]; then
+          _flag=1
+        fi
+        _status="$_counts (rc=$rc)"
+        _update_cfg "$f" "$f $_flag $_counts"
+        echo "      -> $_status"
+        [[ $rc -ne 0 ]] && COMPAT_RC=1
+        continue
+      fi
       set +e
       # 边测边显示：输出流式打印到终端（tee 同时追加完整日志），另存本文件输出供解析。
       env RSARRAY_COMPAT_SKIP_CRASHES=1 PYTHONUNBUFFERED=1 \
