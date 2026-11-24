@@ -3441,6 +3441,89 @@ fn eigvals_qr_batch_core(a: &NdArray) -> PyResult<(NdArray, NdArray)> {
     ))
 }
 
+/// 对称/Hermitian 幂迭代特征分解（语义与 Python _eig_power_iteration
+/// 逐条对齐）：对每个 k 从 e_k 起步、至多 100 次幂迭代（norm² < 1e-24
+/// 提前终止）、Rayleigh 商 v^H·A·v 取特征值、特征向量按列存放、无
+/// deflation。输出 evals (n,) 与 evecs (n,n)（complex 双通道）。
+#[pyfunction]
+fn eig_power_core(a: &NdArray) -> PyResult<(NdArray, NdArray)> {
+    let shape: Vec<usize> = a.data.shape().to_vec();
+    if shape.len() != 2 || shape[0] != shape[1] || shape[0] == 0 {
+        return Err(PyValueError::new_err(
+            "eig_power_core: a must be non-empty (n, n)",
+        ));
+    }
+    let n = shape[0];
+    let mat: Vec<(f64, f64)> = match &a.imag {
+        None => a.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => a
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    let matmul = |v: &[(f64, f64)]| -> Vec<(f64, f64)> {
+        (0..n)
+            .map(|i| {
+                let mut acc = (0.0, 0.0);
+                for j in 0..n {
+                    let p = gj_cmul(mat[i * n + j], v[j]);
+                    acc = (acc.0 + p.0, acc.1 + p.1);
+                }
+                acc
+            })
+            .collect()
+    };
+    let mut evals = vec![(0.0, 0.0); n];
+    let mut evecs = vec![(0.0, 0.0); n * n];
+    for k in 0..n {
+        let mut v: Vec<(f64, f64)> = vec![(0.0, 0.0); n];
+        v[k] = (1.0, 0.0);
+        for _ in 0..100 {
+            let new_v = matmul(&v);
+            let norm_sq: f64 = new_v.iter().map(|x| gj_mag(*x).powi(2)).sum();
+            if norm_sq < 1e-24 {
+                break;
+            }
+            let norm = norm_sq.sqrt();
+            v = new_v.iter().map(|x| cdiv_r(*x, norm)).collect();
+        }
+        let mat_v = matmul(&v);
+        let mut lam = (0.0, 0.0);
+        for i in 0..n {
+            let p = cj_mul(v[i], mat_v[i]);
+            lam = (lam.0 + p.0, lam.1 + p.1);
+        }
+        evals[k] = lam;
+        for i in 0..n {
+            evecs[i * n + k] = v[i];
+        }
+    }
+    let evals_re: Vec<f64> = evals.iter().map(|z| z.0).collect();
+    let evals_im: Vec<f64> = evals.iter().map(|z| z.1).collect();
+    let evecs_re: Vec<f64> = evecs.iter().map(|z| z.0).collect();
+    let evecs_im: Vec<f64> = evecs.iter().map(|z| z.1).collect();
+    let evals_arr = Array::from_shape_vec(IxDyn(&[n]), evals_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let evals_im_arr = Array::from_shape_vec(IxDyn(&[n]), evals_im)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let evecs_arr = Array::from_shape_vec(IxDyn(&[n, n]), evecs_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let evecs_im_arr = Array::from_shape_vec(IxDyn(&[n, n]), evecs_im)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((
+        NdArray {
+            data: evals_arr,
+            imag: Some(evals_im_arr),
+        },
+        NdArray {
+            data: evecs_arr,
+            imag: Some(evecs_im_arr),
+        },
+    ))
+}
+
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dot, m)?)?;
     m.add_function(wrap_pyfunction!(vdot, m)?)?;
@@ -3468,6 +3551,7 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(svd_assemble_core, m)?)?;
     m.add_function(wrap_pyfunction!(qr_householder_core, m)?)?;
     m.add_function(wrap_pyfunction!(eigvals_qr_core, m)?)?;
+    m.add_function(wrap_pyfunction!(eig_power_core, m)?)?;
     m.add_function(wrap_pyfunction!(eigvals_qr_batch_core, m)?)?;
     Ok(())
 }

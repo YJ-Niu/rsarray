@@ -278,6 +278,15 @@ def around(a, decimals=0):
         # 数组语义：整数数组 decimals>=0 时 around 为无操作
         return arr.copy()
 
+    # 数值数组：Rust half-even 内核（消除 1M 元素 Python 逐元素递归）
+    if hasattr(arr, '_array'):
+        try:
+            from . import num_core as _core
+            res = _wrap(_core.round_core(arr._array, int(decimals)))
+            return res.astype(_dt) if _dt != 'float64' else res
+        except Exception:
+            pass
+
     def _rnd(v):
         if decimals >= 0:
             _f = 10 ** decimals
@@ -352,9 +361,9 @@ def fix(x, out=None, **kwargs):
 # ========== 特殊函数 ==========
 def _sqrt_has_negative(x):
     try:
-        from ._extra import _fp_flat
         if hasattr(x, '_array'):
-            return builtins.any(v < 0 for v in _fp_flat(x.tolist()))
+            from . import num_core as _core
+            return _core.has_negative_core(x._array)
         return x < 0
     except Exception:
         return False

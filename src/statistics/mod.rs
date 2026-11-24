@@ -1118,6 +1118,39 @@ fn axis_reduce_layout(
     }
 }
 
+/// 沿 axis 归约时是否存在"全 NaN"归约组（nan 聚合 all-NaN 警告语义
+/// 判定）。axis=None 时等价 all_nan（整个数组为一组）。复数查双通道。
+#[pyfunction]
+#[pyo3(signature = (x, axis))]
+fn nan_groups_allnan(x: &NdArray, axis: Option<isize>) -> PyResult<bool> {
+    let shape = x.data.shape().to_vec();
+    let (outer, dim_size, inner, _rs) = axis_reduce_layout(&shape, axis, false)?;
+    let data: Vec<f64> = x.data.iter().copied().collect();
+    let imag: Option<Vec<f64>> = x.imag.as_ref().map(|im| im.iter().copied().collect());
+    let is_nan = |i: usize| -> bool {
+        match &imag {
+            None => data[i].is_nan(),
+            Some(im) => data[i].is_nan() || (i < im.len() && im[i].is_nan()),
+        }
+    };
+    for out_o in 0..outer {
+        for inn in 0..inner {
+            let base = out_o * dim_size * inner;
+            let mut group_all_nan = true;
+            for i in 0..dim_size {
+                if !is_nan(base + i * inner + inn) {
+                    group_all_nan = false;
+                    break;
+                }
+            }
+            if group_all_nan {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 /// 沿轴求和（NaN 视为 0）。
 #[pyfunction]
 #[pyo3(signature = (x, axis=None, keepdims=false))]
@@ -1745,6 +1778,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(trim_zeros, m)?)?;
     m.add_function(wrap_pyfunction!(bincount_weighted, m)?)?;
     m.add_function(wrap_pyfunction!(nansum, m)?)?;
+    m.add_function(wrap_pyfunction!(nan_groups_allnan, m)?)?;
     m.add_function(wrap_pyfunction!(nanprod, m)?)?;
     m.add_function(wrap_pyfunction!(nanmax, m)?)?;
     m.add_function(wrap_pyfunction!(nanmin, m)?)?;

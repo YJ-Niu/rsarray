@@ -172,16 +172,12 @@ def _ckey(v):
 
 
 def _has_nan_arr(a):
-    """数组是否含 NaN（int/bool 恒 False）。"""
+    """数组是否含 NaN（int/bool 恒 False；Rust 内核 O(n) 快速检查）。"""
     k = _dt_kind(getattr(a, '_dtype', None))
     if k not in 'fc':
         return False
-    rs = _rs()
-    v = rs.isnan(a).any()
-    try:
-        return bool(v)
-    except Exception:
-        return bool(v.tolist() if hasattr(v, 'tolist') else v)
+    import rsarray.num_core as _core
+    return _core.has_nan_core(a._array)
 
 
 # ------------------------------------------------------------------ 归约引擎
@@ -792,7 +788,13 @@ def _reduce_wrap(results, axes, shape, keepdims, dtype, out, src):
 
 
 def _simple_fast(a, axis, out):
-    """Rust 快路径条件：ndarray（非子类）、axis None/int、ndim>=1、无 NaN、无 out。"""
+    """Rust 快路径条件：ndarray（非子类）、axis None/int、ndim>=1、无 out。
+
+    NaN 策略：Rust 归约的值语义与 Python 一致（nansum=0/nanprod=1/
+    nanmean=nanmin=nanmax=nan），仅 all-NaN slice 的 RuntimeWarning 在
+    快路径上不触发——因此只拦截会触发警告的场景（全 NaN 数组 +
+    axis=None；axis 归约含 NaN 时无法廉价判定是否存在全 NaN slice，
+    保守拦截），其余含 NaN 输入放行快路径。"""
     rs = _rs()
     if out is not None or type(a) is not rs.ndarray:
         return False
@@ -807,7 +809,15 @@ def _simple_fast(a, axis, out):
     if not (axis is None or isinstance(axis, int)):
         return False
     if _has_nan_arr(a):
-        return False
+        if axis is not None:
+            # axis 归约：仅当存在"全 NaN 归约组"（触发 all-NaN 警告）
+            # 才走慢路径，否则 Rust 值语义一致放行
+            import rsarray.num_core as _core
+            if _core.nan_groups_allnan(a._array, axis):
+                return False
+        import rsarray.num_core as _core
+        if _core.all_nan_core(a._array):
+            return False
     return True
 
 

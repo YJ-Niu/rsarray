@@ -358,13 +358,22 @@ def _eig_one(mat):
     from rsarray import ndarray as _nd
 
     dt = getattr(mat, '_dtype', 'float64')
-    if dt in ('complex64', 'complex128'):
-        return _eig_general(mat.tolist())
-    try:
-        ev, ec = _core.linalg.eig(mat._array)
-        return (_nd._wrap(ev).tolist(), _nd._wrap(ec).tolist())
-    except ValueError:
-        return _eig_general(mat.tolist())
+    if dt not in ('complex64', 'complex128'):
+        try:
+            ev, ec = _core.linalg.eig(mat._array)
+            return (_nd._wrap(ev).tolist(), _nd._wrap(ec).tolist())
+        except ValueError:
+            pass
+    m = mat.tolist()
+    # 对称/Hermitian：幂迭代 Rust 内核（消除 O(n⁴) Python 逐元素迭代）；
+    # 失败回退纯 Python 版本
+    if _is_symmetricish(m):
+        try:
+            ev, ec = _core.linalg.eig_power_core(mat._array)
+            return (_nd._wrap(ev).tolist(), _nd._wrap(ec).tolist())
+        except Exception:
+            pass
+    return _eig_general(m)
 
 
 def _gauss_jordan_solve(mat, b):

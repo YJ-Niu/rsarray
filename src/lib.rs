@@ -3186,6 +3186,61 @@ fn unique_1d_core(
     ))
 }
 
+/// 实数数组是否含 NaN（复数组查 real/imag 双通道）。Python 侧
+/// _has_nan_arr 等全量展平检查（tolist+any）的 O(n) Rust 替代。
+#[pyfunction]
+fn has_nan_core(a: &NdArray) -> PyResult<bool> {
+    Ok(a.data.iter().any(|v| v.is_nan())
+        || a.imag
+            .as_ref()
+            .is_some_and(|im| im.iter().any(|v| v.is_nan())))
+}
+
+/// 实数数组是否全为 NaN（复数组查 real/imag 双通道）——nan 聚合的
+/// all-NaN 警告语义（"Mean of empty slice"/"All-NaN slice"）判定。
+#[pyfunction]
+fn all_nan_core(a: &NdArray) -> PyResult<bool> {
+    Ok(a.data.iter().all(|v| v.is_nan())
+        && a.imag
+            .as_ref()
+            .map(|im| im.iter().all(|v| v.is_nan()))
+            .unwrap_or(true))
+}
+
+/// 实数数组是否含负值（sqrt 的 invalid 触发检查）。复数输入恒 False
+/// （复数 sqrt 无 invalid 语义）。
+#[pyfunction]
+fn has_negative_core(a: &NdArray) -> PyResult<bool> {
+    if a.imag.is_some() {
+        return Ok(false);
+    }
+    Ok(a.data.iter().any(|&v| v < 0.0))
+}
+
+/// 数组舍入（Python round half-even 语义）：rint(x·10^d)/10^d
+/// （d<0 时 rint(x/10^-d)·10^-d）。与 math_functions.around 的
+/// _rnd（builtins.round half-even）位级一致。
+#[pyfunction]
+#[pyo3(signature = (a, decimals))]
+fn round_core(a: &NdArray, decimals: i32) -> PyResult<NdArray> {
+    let data: Vec<f64> = a
+        .data
+        .iter()
+        .map(|&v| {
+            if decimals >= 0 {
+                let f = 10f64.powi(decimals);
+                (v * f).round_ties_even() / f
+            } else {
+                let f = 10f64.powi(-decimals);
+                (v / f).round_ties_even() * f
+            }
+        })
+        .collect();
+    let data = Array::from_shape_vec(a.data.shape(), data)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray { data, imag: None })
+}
+
 #[pymodule]
 fn num_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NdArray>()?;
@@ -3219,6 +3274,10 @@ fn num_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fft::py_irfft_ndarray, m)?)?;
     m.add_function(wrap_pyfunction!(fp_arith_check_core, m)?)?;
     m.add_function(wrap_pyfunction!(unique_1d_core, m)?)?;
+    m.add_function(wrap_pyfunction!(has_nan_core, m)?)?;
+    m.add_function(wrap_pyfunction!(all_nan_core, m)?)?;
+    m.add_function(wrap_pyfunction!(has_negative_core, m)?)?;
+    m.add_function(wrap_pyfunction!(round_core, m)?)?;
 
     let random_module = PyModule::new(m.py(), "random")?;
     random::init_module(&random_module)?;
