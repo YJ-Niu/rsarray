@@ -1692,10 +1692,9 @@ class linalg_module:
                              vt.reshape(lead + tuple(results[0].Vh.shape)))
 
         def _core_ok(sub):
-            # core Jacobi SVD：2-d 非空实数矩阵（复数/空/异常回退
+            # core Jacobi SVD：2-d 非空矩阵（实数/复数；空/异常回退
             # 纯 Python Jacobi）
-            return (sub.ndim == 2 and sub.size > 0
-                    and not _is_complex_arr(sub))
+            return sub.ndim == 2 and sub.size > 0
 
         def _one(sub):
             if not compute_uv:

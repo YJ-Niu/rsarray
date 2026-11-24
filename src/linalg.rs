@@ -2085,6 +2085,46 @@ fn jcol_dot(work: &[f64], mm: usize, nn: usize, p: usize, q: usize) -> f64 {
     s
 }
 
+/// 复共轭
+#[inline]
+fn cj(z: (f64, f64)) -> (f64, f64) {
+    (z.0, -z.1)
+}
+
+/// 复 × 实标量
+#[inline]
+fn sc_mul(z: (f64, f64), r: f64) -> (f64, f64) {
+    (z.0 * r, z.1 * r)
+}
+
+/// conj(a) * b
+#[inline]
+fn cj_mul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 * b.0 + a.1 * b.1, a.0 * b.1 - a.1 * b.0)
+}
+
+/// 复 ÷ 实标量
+#[inline]
+fn cdiv_r(z: (f64, f64), r: f64) -> (f64, f64) {
+    (z.0 / r, z.1 / r)
+}
+
+/// 复乘法（运算次序与 Python complex 一致）
+#[inline]
+fn gj_cmul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+
+/// 复列内积 Σ conj(w[i,p]) * w[i,q]
+fn jcol_dot_c(work: &[(f64, f64)], mm: usize, nn: usize, p: usize, q: usize) -> (f64, f64) {
+    let mut s = (0.0, 0.0);
+    for i in 0..mm {
+        let t = cj_mul(work[i * nn + p], work[i * nn + q]);
+        s = (s.0 + t.0, s.1 + t.1);
+    }
+    s
+}
+
 /// 单侧 Jacobi SVD 共享实现（仅实数），语义与 Python _svd_jacobi
 /// （实数分支）逐条对齐：m<n 转置为 A^T 分解、末端回映；100 sweeps，
 /// 收敛 off <= 1e-28*sum(d²)+1e-300；ag <= 1e-15*sqrt(alpha*beta) 跳过
@@ -2253,28 +2293,250 @@ fn svd_jacobi_impl(
     (u_out, u_shape, sig, vh_out, v_shape)
 }
 
-/// SVD 输入校验：2-d 非空实数矩阵；复数/空 → Err（Python 侧回退
-/// 纯 Python Jacobi）。返回 (m, n, flat data)。
-fn svd_jacobi_check(a: &NdArray) -> PyResult<(usize, usize, Vec<f64>)> {
+/// 单侧 Jacobi SVD 复数共享实现。语义与 Python _svd_jacobi 复数分支
+/// 逐条对齐：m<n 转置为 A^T（纯转置）分解、末端回映；100 sweeps，收敛
+/// off <= 1e-28*sum(d²)+1e-300（off = Σ|交叉|²，d = |列自内积|）；
+/// ag <= 1e-15*sqrt(alpha*beta) 跳过旋转；先将交叉项相位归一到 |gamma|
+/// （phase = conj(gamma)/|gamma|，work 列 q 与 v_acc 列 q 乘 phase），
+/// 其后半角 t/z 与旋转同实数版（c, s 实数）；sig 降序稳定排序
+/// （并列/NaN 保持原序）；U 对 sp <= 1e-15*smax 的列留零；Vh = V^H
+/// （共轭转置 + 重排）；full 且 mm>nn 时复 Gram-Schmidt 补基
+/// （ne < 1e-8 跳过）；转置分支 u_out = Vh^T、vh_out = U^T（纯转置）；
+/// 非有限复数边缘 |phase|<=0（Python 会在 `z >= 0` 抛 TypeError）→
+/// 返回 Err，由 Python 兜底复现同一异常。
+/// 返回 (u re, u im, u shape, sig, vh re, vh im, vh shape)。
+fn svd_jacobi_impl_c(
+    re: &[f64],
+    im: &[f64],
+    m: usize,
+    n: usize,
+    full_matrices: bool,
+) -> PyResult<(
+    Vec<f64>,
+    Vec<f64>,
+    (usize, usize),
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    (usize, usize),
+)> {
+    let k = m.min(n);
+    let transposed = m < n;
+    let (mm, nn) = if transposed { (n, m) } else { (m, n) };
+    let mut work: Vec<(f64, f64)> = if transposed {
+        let mut w = vec![(0.0, 0.0); mm * nn];
+        for i in 0..m {
+            for j in 0..n {
+                w[j * nn + i] = (re[i * n + j], im[i * n + j]);
+            }
+        }
+        w
+    } else {
+        re.iter().zip(im.iter()).map(|(&r, &i)| (r, i)).collect()
+    };
+    let mut v_acc: Vec<(f64, f64)> = vec![(0.0, 0.0); nn * nn];
+    for i in 0..nn {
+        v_acc[i * nn + i] = (1.0, 0.0);
+    }
+    for _sweep in 0..100 {
+        let mut off = 0.0;
+        let diag: Vec<f64> = (0..nn)
+            .map(|p| gj_mag(jcol_dot_c(&work, mm, nn, p, p)))
+            .collect();
+        for p in 0..nn {
+            for q in (p + 1)..nn {
+                let g = gj_mag(jcol_dot_c(&work, mm, nn, p, q));
+                off += g * g;
+            }
+        }
+        if off <= 1e-28 * diag.iter().map(|d| d * d).sum::<f64>() + 1e-300 {
+            break;
+        }
+        for p in 0..nn {
+            for q in (p + 1)..nn {
+                let alpha = gj_mag(jcol_dot_c(&work, mm, nn, p, p));
+                let beta = gj_mag(jcol_dot_c(&work, mm, nn, q, q));
+                let gamma = jcol_dot_c(&work, mm, nn, p, q);
+                let ag = gj_mag(gamma);
+                if ag <= 1e-15 * (alpha * beta).sqrt() {
+                    continue;
+                }
+                let phase = cdiv_r(cj(gamma), ag);
+                if ag <= 0.0 || gj_mag(phase) <= 0.0 {
+                    // 非有限边缘：Python 对复数 `z >= 0` 抛 TypeError，
+                    // 这里统一 Err，Python 兜底复现同一异常
+                    return Err(PyValueError::new_err(
+                        "svd_jacobi: non-finite complex entry",
+                    ));
+                }
+                for i in 0..mm {
+                    work[i * nn + q] = gj_cmul(work[i * nn + q], phase);
+                }
+                for i in 0..nn {
+                    v_acc[i * nn + q] = gj_cmul(v_acc[i * nn + q], phase);
+                }
+                let z = (beta - alpha) / (2.0 * ag);
+                let t = if z >= 0.0 { -1.0 } else { 1.0 } / (z.abs() + (1.0 + z * z).sqrt());
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let s = t * c;
+                for i in 0..mm {
+                    let wp = work[i * nn + p];
+                    let wq = work[i * nn + q];
+                    let cwp = sc_mul(wp, c);
+                    let cwq = sc_mul(wq, c);
+                    let swp = sc_mul(wp, s);
+                    let swq = sc_mul(wq, s);
+                    work[i * nn + p] = (cwp.0 + swq.0, cwp.1 + swq.1);
+                    work[i * nn + q] = (cwq.0 - swp.0, cwq.1 - swp.1);
+                }
+                for i in 0..nn {
+                    let vp = v_acc[i * nn + p];
+                    let vq = v_acc[i * nn + q];
+                    let cvp = sc_mul(vp, c);
+                    let cvq = sc_mul(vq, c);
+                    let svp = sc_mul(vp, s);
+                    let svq = sc_mul(vq, s);
+                    v_acc[i * nn + p] = (cvp.0 + svq.0, cvp.1 + svq.1);
+                    v_acc[i * nn + q] = (cvq.0 - svp.0, cvq.1 - svp.1);
+                }
+            }
+        }
+    }
+    let sig_raw: Vec<f64> = (0..nn)
+        .map(|p| gj_mag(jcol_dot_c(&work, mm, nn, p, p)).sqrt())
+        .collect();
+    let mut order: Vec<usize> = (0..nn).collect();
+    order.sort_by(|&x, &y| {
+        sig_raw[y]
+            .partial_cmp(&sig_raw[x])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let sig: Vec<f64> = order.iter().map(|&p| sig_raw[p]).collect();
+    let smax = sig.first().copied().unwrap_or(0.0);
+    let mut u_part: Vec<(f64, f64)> = vec![(0.0, 0.0); mm * nn];
+    for (new_p, &old_p) in order.iter().enumerate() {
+        let sp = sig[new_p];
+        if sp > 1e-15 * smax {
+            for i in 0..mm {
+                u_part[i * nn + new_p] = cdiv_r(work[i * nn + old_p], sp);
+            }
+        }
+    }
+    // Vh = V^H：Vh[i][j] = conj(v_acc[j][order[i]])
+    let mut vh_mat: Vec<(f64, f64)> = vec![(0.0, 0.0); nn * nn];
+    for i in 0..nn {
+        for j in 0..nn {
+            vh_mat[i * nn + j] = cj(v_acc[j * nn + order[i]]);
+        }
+    }
+    // u_part 补零至 (mm, mm)
+    let mut u_pad: Vec<(f64, f64)> = vec![(0.0, 0.0); mm * mm];
+    for i in 0..mm {
+        for j in 0..nn {
+            u_pad[i * mm + j] = u_part[i * nn + j];
+        }
+    }
+    if full_matrices && mm > nn {
+        // 复 Gram-Schmidt：proj = Σ conj(b[r]) e[r]，e -= proj * b
+        let mut basis: Vec<Vec<(f64, f64)>> = (0..nn)
+            .map(|p| (0..mm).map(|i| u_pad[i * mm + p]).collect())
+            .collect();
+        for i in 0..mm {
+            let mut e: Vec<(f64, f64)> = (0..mm)
+                .map(|r| if r == i { (1.0, 0.0) } else { (0.0, 0.0) })
+                .collect();
+            for b in basis.iter() {
+                let mut proj = (0.0, 0.0);
+                for r in 0..mm {
+                    let t = cj_mul(b[r], e[r]);
+                    proj = (proj.0 + t.0, proj.1 + t.1);
+                }
+                for r in 0..mm {
+                    let t = gj_cmul(proj, b[r]);
+                    e[r] = (e[r].0 - t.0, e[r].1 - t.1);
+                }
+            }
+            let ne = (0..mm).map(|r| gj_mag(e[r]).powi(2)).sum::<f64>().sqrt();
+            if ne < 1e-8 {
+                continue;
+            }
+            basis.push(e.iter().map(|&z| cdiv_r(z, ne)).collect());
+            if basis.len() == mm {
+                break;
+            }
+        }
+        for (col_idx, col) in basis.iter().enumerate().skip(nn) {
+            for i in 0..mm {
+                u_pad[i * mm + col_idx] = col[i];
+            }
+        }
+    }
+    let (u_full, vh_full): (Vec<(f64, f64)>, Vec<(f64, f64)>) = if transposed {
+        let mut u_out = vec![(0.0, 0.0); nn * nn];
+        for i in 0..nn {
+            for j in 0..nn {
+                u_out[j * nn + i] = vh_mat[i * nn + j];
+            }
+        }
+        let mut vh_out = vec![(0.0, 0.0); mm * mm];
+        for i in 0..mm {
+            for j in 0..mm {
+                vh_out[i * mm + j] = u_pad[j * mm + i];
+            }
+        }
+        (u_out, vh_out)
+    } else {
+        (u_pad, vh_mat)
+    };
+    let mut u_out = u_full;
+    let mut vh_out = vh_full;
+    let mut u_shape = (m, m);
+    let mut v_shape = (n, n);
+    if !full_matrices {
+        let nu: Vec<(f64, f64)> = (0..m)
+            .flat_map(|i| u_out[i * m..i * m + k].iter().copied())
+            .collect();
+        let nv = vh_out[..k * n].to_vec();
+        u_shape = (m, k);
+        v_shape = (k, n);
+        u_out = nu;
+        vh_out = nv;
+    }
+    Ok((
+        u_out.iter().map(|z| z.0).collect(),
+        u_out.iter().map(|z| z.1).collect(),
+        u_shape,
+        sig,
+        vh_out.iter().map(|z| z.0).collect(),
+        vh_out.iter().map(|z| z.1).collect(),
+        v_shape,
+    ))
+}
+
+/// SVD 输入校验：2-d 非空矩阵（实数/复数）；空 → Err（Python 侧回退
+/// 纯 Python Jacobi）。返回 (m, n, flat real, flat imag — 实数为 None)。
+fn svd_jacobi_check(a: &NdArray) -> PyResult<(usize, usize, Vec<f64>, Option<Vec<f64>>)> {
     let shape: Vec<usize> = a.data.shape().to_vec();
     if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
         return Err(PyValueError::new_err(
             "svd_jacobi: a must be non-empty (m, n)",
         ));
     }
-    if a.imag.is_some() {
-        return Err(PyValueError::new_err("svd_jacobi: complex unsupported"));
-    }
     let data: Vec<f64> = a.data.iter().copied().collect();
-    Ok((shape[0], shape[1], data))
+    let imag = a.imag.as_ref().map(|arr| arr.iter().copied().collect());
+    Ok((shape[0], shape[1], data, imag))
 }
 
-/// SVD 奇异值（仅实数，任意 m×n）：1-d 降序 sig（len = min(m,n)）。
-/// 复数/空矩阵返回 Err，由 Python 侧回退纯 Python Jacobi。
+/// SVD 奇异值（任意 m×n，实数/复数）：1-d 降序 sig（len = min(m,n)）。
+/// 空矩阵返回 Err，由 Python 侧回退纯 Python Jacobi；非有限复数边缘
+/// 亦 Err（Python 同样情形抛 TypeError）。
 #[pyfunction]
 fn svd_jacobi_sig(a: &NdArray) -> PyResult<NdArray> {
-    let (m, n, data) = svd_jacobi_check(a)?;
-    let (_, _, sig, _, _) = svd_jacobi_impl(&data, m, n, false);
+    let (m, n, data, imag) = svd_jacobi_check(a)?;
+    let sig = match imag {
+        None => svd_jacobi_impl(&data, m, n, false).2,
+        Some(im) => svd_jacobi_impl_c(&data, &im, m, n, false)?.3,
+    };
     let arr = Array::from_shape_vec(IxDyn(&[sig.len()]), sig)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     Ok(NdArray {
@@ -2283,33 +2545,65 @@ fn svd_jacobi_sig(a: &NdArray) -> PyResult<NdArray> {
     })
 }
 
-/// 完整 SVD（仅实数）：(u, s, vh)——full：u (m,m)、vh (n,n)；
-/// reduced：u (m,k)、vh (k,n)，s 降序 (k,)。语义与 Python
-/// _svd_jacobi（实数分支）一致；复数/空矩阵返回 Err。
+/// 完整 SVD（任意 m×n，实数/复数）：(u, s, vh)——full：u (m,m)、vh
+/// (n,n)；reduced：u (m,k)、vh (k,n)，s 降序 (k,)。语义与 Python
+/// _svd_jacobi 实数/复数分支一致；空矩阵返回 Err。
 #[pyfunction]
 fn svd_jacobi_uv(a: &NdArray, full_matrices: bool) -> PyResult<(NdArray, NdArray, NdArray)> {
-    let (m, n, data) = svd_jacobi_check(a)?;
-    let (u, us, sig, vh, vs) = svd_jacobi_impl(&data, m, n, full_matrices);
-    let u_arr = Array::from_shape_vec(IxDyn(&[us.0, us.1]), u)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let s_arr = Array::from_shape_vec(IxDyn(&[sig.len()]), sig)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let vh_arr = Array::from_shape_vec(IxDyn(&[vs.0, vs.1]), vh)
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    Ok((
-        NdArray {
-            data: u_arr,
-            imag: None,
-        },
-        NdArray {
-            data: s_arr,
-            imag: None,
-        },
-        NdArray {
-            data: vh_arr,
-            imag: None,
-        },
-    ))
+    let (m, n, data, imag) = svd_jacobi_check(a)?;
+    match imag {
+        None => {
+            let (u, us, sig, vh, vs) = svd_jacobi_impl(&data, m, n, full_matrices);
+            let u_arr = Array::from_shape_vec(IxDyn(&[us.0, us.1]), u)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let s_arr = Array::from_shape_vec(IxDyn(&[sig.len()]), sig)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let vh_arr = Array::from_shape_vec(IxDyn(&[vs.0, vs.1]), vh)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Ok((
+                NdArray {
+                    data: u_arr,
+                    imag: None,
+                },
+                NdArray {
+                    data: s_arr,
+                    imag: None,
+                },
+                NdArray {
+                    data: vh_arr,
+                    imag: None,
+                },
+            ))
+        }
+        Some(im) => {
+            let (u_re, u_im, us, sig, vh_re, vh_im, vs) =
+                svd_jacobi_impl_c(&data, &im, m, n, full_matrices)?;
+            let u_arr = Array::from_shape_vec(IxDyn(&[us.0, us.1]), u_re)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let u_imag = Array::from_shape_vec(IxDyn(&[us.0, us.1]), u_im)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let s_arr = Array::from_shape_vec(IxDyn(&[sig.len()]), sig)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let vh_arr = Array::from_shape_vec(IxDyn(&[vs.0, vs.1]), vh_re)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let vh_imag = Array::from_shape_vec(IxDyn(&[vs.0, vs.1]), vh_im)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Ok((
+                NdArray {
+                    data: u_arr,
+                    imag: Some(u_imag),
+                },
+                NdArray {
+                    data: s_arr,
+                    imag: None,
+                },
+                NdArray {
+                    data: vh_arr,
+                    imag: Some(vh_imag),
+                },
+            ))
+        }
+    }
 }
 
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
