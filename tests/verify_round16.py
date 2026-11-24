@@ -77,6 +77,15 @@ def main():
     # 正常加法不触发
     check("normal add no raise",
           not raises_fp_error(lambda: a + b))
+    # ---- divide errstate 语义（第二十二轮接线）----
+    try:
+        with np.errstate(divide='raise'):
+            np.array([1.0, 2.0]) / np.array([1.0, 0.0])
+        check("divide by zero raises", False)
+    except FloatingPointError:
+        check("divide by zero raises", True)
+    check("divide normal no raise",
+          not raises_fp_error(lambda: np.array([4.0, 8.0]) / np.array([2.0, 4.0])))
     # ---- 性能（1M 元素二元算术）----
     bench("add 1M", lambda: a + b)
     bench("mul 1M", lambda: a * b)

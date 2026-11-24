@@ -3066,6 +3066,31 @@ fn fp_arith_check_core(
             {
                 un_f = true;
             }
+        } else if op == "divide" {
+            // 语义同 Python _fp_divide_check：分母无零 → 无触发；
+            // 否则按结果顺序首个 inf → divide、首个 nan → invalid
+            //（命中即停，与 Python 的 fire-and-return 一致）
+            let mut den_has_zero = false;
+            for i in 0..fp_len(&so) {
+                if fp_get(&so, i) == 0.0 {
+                    den_has_zero = true;
+                    break;
+                }
+            }
+            if !den_has_zero {
+                return Ok((false, false, false));
+            }
+            for i in 0..fp_len(&sr) {
+                let r = fp_get(&sr, i);
+                if r.is_infinite() {
+                    ov_f = true;
+                    break;
+                }
+                if r.is_nan() {
+                    inv_f = true;
+                    break;
+                }
+            }
         } else {
             let ov = if op == "add" {
                 (a > 0.0 && b > 0.0 && ri && r > 0.0) || (a < 0.0 && b < 0.0 && ri && r < 0.0)

@@ -4247,11 +4247,36 @@ def _fp_fire(kind, msg):
 
 def _fp_divide_check(num, den, res, op='true_divide'):
     """true_divide 的 errstate 触发（数组语义）：除零 → 'divide'，
-    0/0 → 'invalid'。仅当存在非 ignore 模式时扫描，避免常态开销。"""
+    0/0 → 'invalid'。仅当存在非 ignore 模式时扫描，避免常态开销。
+
+    实数数组/float 标量走 Rust 快速路径（同 fp_arith_check_core 的
+    divide 分支）；int/bool/complex 输入走原 Python 逐元素逻辑。"""
     st = _err_state_ctx.get()
     eff = st or _ERR_DEFAULT
     if (eff.get('divide', 'warn') == 'ignore'
             and eff.get('invalid', 'warn') == 'ignore'):
+        return
+
+    def _fp_like(x):
+        d = getattr(x, '_dtype', None)
+        if d is not None:
+            return d.startswith('float')
+        if isinstance(x, bool) or isinstance(x, int):
+            return False
+        return isinstance(x, float)
+
+    if _fp_like(num) and _fp_like(den) and _fp_like(res):
+        try:
+            ov, inv, _un = _core.fp_arith_check_core(
+                getattr(num, '_array', num),
+                getattr(den, '_array', den),
+                getattr(res, '_array', res), 'divide')
+        except Exception:
+            return
+        if ov:
+            _fp_fire('divide', f'divide by zero encountered in {op}')
+        if inv:
+            _fp_fire('invalid', f'invalid value encountered in {op}')
         return
     try:
         def _flat(x):
