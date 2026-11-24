@@ -1865,6 +1865,19 @@ class linalg_module:
                             ndarray._wrap(r).astype(res_dt))
                 except Exception:
                     pass
+            # core Householder QR（任意尺寸实/复，消除 tolist 往返）；
+            # raw 语义不同（_qr_raw 的 H/tau）不走；异常回退纯 Python
+            if mode != 'raw':
+                try:
+                    q_raw, r_raw = _core.linalg.qr_householder_core(
+                        sub._array, mode == 'complete')
+                    q = ndarray._wrap(q_raw).astype(res_dt)
+                    r = ndarray._wrap(r_raw).astype(res_dt)
+                    if mode == 'r':
+                        return r
+                    return (q, r)
+                except Exception:
+                    pass
             q, r = linalg_module._qr_householder(
                 sub, mode if mode in ('reduced', 'complete') else 'reduced')
             q = q.astype(res_dt)
