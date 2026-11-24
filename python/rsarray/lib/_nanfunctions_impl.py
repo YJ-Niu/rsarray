@@ -621,6 +621,15 @@ def _replace_nan(a, val):
         mask = rs.not_equal(a, a)
     elif k in 'fc':
         mask = rs.isnan(a)
+        # 实数：Rust 替换内核（O(n)，替代布尔掩码 setitem 慢路径）；
+        # 复数走原掩码 setitem
+        if k == 'f':
+            try:
+                import rsarray.num_core as _core_rn
+                return _core_rn.linalg.replace_nan_core(
+                    a._array, float(val)), mask
+            except Exception:
+                pass
     else:
         return a, None
     if len(tuple(a.shape)) == 0:

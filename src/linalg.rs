@@ -3798,6 +3798,27 @@ fn has_nonfinite_core(a: &NdArray) -> PyResult<bool> {
             .is_some_and(|im| im.iter().any(|v| v.is_nan() || v.is_infinite())))
 }
 
+/// 实数数组 NaN→val 替换（_replace_nan 的 O(n) 内核，替代布尔掩码
+/// setitem 慢路径）。复数输入 → Err（Python 兜底）。
+#[pyfunction]
+#[pyo3(signature = (a, val))]
+fn replace_nan_core(a: &NdArray, val: f64) -> PyResult<NdArray> {
+    if a.imag.is_some() {
+        return Err(PyValueError::new_err("complex input"));
+    }
+    let data: Vec<f64> = a
+        .data
+        .iter()
+        .map(|&v| if v.is_nan() { val } else { v })
+        .collect();
+    let arr = Array::from_shape_vec(IxDyn(a.data.shape()), data)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        data: arr,
+        imag: None,
+    })
+}
+
 /// 1-D/全归约百分位数（语义与 Python _percentile_1d/'linear' 对齐）：
 /// nan_filter=True 过滤 NaN（nanpercentile），False 时 NaN 传染（结果
 /// NaN）；q01∈[0,1]，虚指数 vidx = q01·(n-1)，clamp 后线性插值
@@ -3865,6 +3886,7 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(nanarg_core, m)?)?;
     m.add_function(wrap_pyfunction!(percentile_core, m)?)?;
     m.add_function(wrap_pyfunction!(has_nonfinite_core, m)?)?;
+    m.add_function(wrap_pyfunction!(replace_nan_core, m)?)?;
     m.add_function(wrap_pyfunction!(eigvals_qr_batch_core, m)?)?;
     Ok(())
 }

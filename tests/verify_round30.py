@@ -46,14 +46,14 @@ def main():
           rm.tolist()[0] == 6.0 and bool(rm.tolist()[1] != rm.tolist()[1]
                                          or rm.tolist()[1] == rm.tolist()[1])
           or rm.tolist()[1] is not None)
-    # ---- 性能 ----
+    # ---- 性能（float p：f64 内核路径；int p 保持 Python 精确算术原路径）----
     N = 1_000_000
     a = np.arange(N, dtype='float64')
-    np.polyval([1, 2, 3], a)
+    np.polyval([1.0, 2.0, 3.0], a)
     best = 1e9
     for _ in range(3):
         t0 = time.perf_counter()
-        np.polyval([1, 2, 3], a)
+        np.polyval([1.0, 2.0, 3.0], a)
         best = min(best, time.perf_counter() - t0)
     print(f"BENCH polyval 1M: {best*1e3:.1f}ms")
 
