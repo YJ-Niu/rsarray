@@ -3083,6 +3083,109 @@ fn fp_arith_check_core(
     Ok((ov_f, inv_f, un_f))
 }
 
+/// 1-D 数值 unique（排序法 O(n log n)）：语义与 array_ops.unique 的
+/// axis=None 主路径对齐——稳定排序（相等元素保原序；NaN 视为最大排
+/// 最后，组内按原序；-0.0 与 0.0 视为相等）、相邻合并（equal_nan=True
+/// 时全部 NaN 归一，False 时各 NaN 独立）、值保留首次出现者
+/// （稳定排序保证组首即原序最先出现）。want_sorted=False 时输出按
+/// 首次出现序重排。返回 (values, first, inverse, counts)。
+/// 复数/空数组 → Err，由 Python 侧回退原路径。
+#[pyfunction]
+#[pyo3(signature = (a, equal_nan, want_sorted))]
+fn unique_1d_core(
+    a: &NdArray,
+    equal_nan: bool,
+    want_sorted: bool,
+) -> PyResult<(NdArray, NdArray, NdArray, NdArray)> {
+    if a.imag.is_some() {
+        return Err(PyValueError::new_err("complex input"));
+    }
+    let n = a.data.len();
+    if n == 0 {
+        return Err(PyValueError::new_err("empty input"));
+    }
+    let data: Vec<f64> = a.data.iter().copied().collect();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&p, &q| {
+        let (x, y) = (data[p], data[q]);
+        match (x.is_nan(), y.is_nan()) {
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            // NaN 组内按原序（稳定）；-0.0 与 0.0 相等（partial_cmp）
+            (true, true) => std::cmp::Ordering::Equal,
+            _ => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+        }
+    });
+    struct G {
+        v: f64,
+        first: usize,
+        cnt: usize,
+    }
+    let mut groups: Vec<G> = Vec::new();
+    let mut inv = vec![0usize; n];
+    for &p in order.iter() {
+        let v = data[p];
+        if let Some(g) = groups.last_mut() {
+            let eq = g.v == v || (equal_nan && g.v.is_nan() && v.is_nan());
+            if eq {
+                g.cnt += 1;
+                inv[p] = groups.len() - 1;
+                continue;
+            }
+        }
+        inv[p] = groups.len();
+        groups.push(G {
+            v,
+            first: p,
+            cnt: 1,
+        });
+    }
+    let k = groups.len();
+    let mut vals_v: Vec<f64> = Vec::with_capacity(k);
+    let mut first_v: Vec<f64> = Vec::with_capacity(k);
+    let mut cnt_v: Vec<f64> = Vec::with_capacity(k);
+    for g in groups.iter() {
+        vals_v.push(g.v);
+        first_v.push(g.first as f64);
+        cnt_v.push(g.cnt as f64);
+    }
+    if !want_sorted {
+        // 首次出现序重排：组按 first 升序，inverse 同步重映射
+        let mut order2: Vec<usize> = (0..k).collect();
+        order2.sort_by_key(|&gi| groups[gi].first);
+        let mut pos = vec![0usize; k];
+        let mut v2 = vec![0.0f64; k];
+        let mut f2 = vec![0.0f64; k];
+        let mut c2 = vec![0.0f64; k];
+        for (new, old) in order2.iter().enumerate() {
+            pos[*old] = new;
+            v2[new] = vals_v[*old];
+            f2[new] = first_v[*old];
+            c2[new] = cnt_v[*old];
+        }
+        for i in 0..n {
+            inv[i] = pos[inv[i]];
+        }
+        vals_v = v2;
+        first_v = f2;
+        cnt_v = c2;
+    }
+    let to_arr = |v: Vec<f64>| -> PyResult<NdArray> {
+        let arr = Array::from_shape_vec(IxDyn(&[v.len()]), v)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(NdArray {
+            data: arr,
+            imag: None,
+        })
+    };
+    Ok((
+        to_arr(vals_v)?,
+        to_arr(first_v)?,
+        to_arr(inv.iter().map(|&i| i as f64).collect())?,
+        to_arr(cnt_v)?,
+    ))
+}
+
 #[pymodule]
 fn num_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<NdArray>()?;
@@ -3115,6 +3218,7 @@ fn num_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fft::py_rfft_ndarray, m)?)?;
     m.add_function(wrap_pyfunction!(fft::py_irfft_ndarray, m)?)?;
     m.add_function(wrap_pyfunction!(fp_arith_check_core, m)?)?;
+    m.add_function(wrap_pyfunction!(unique_1d_core, m)?)?;
 
     let random_module = PyModule::new(m.py(), "random")?;
     random::init_module(&random_module)?;

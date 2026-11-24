@@ -1396,6 +1396,32 @@ def unique(a, return_index=False, return_inverse=False, return_counts=False,
             pass
         return False
 
+    # ---------- 数值 1-D 快速路径（Rust 排序法 O(n log n)）----------
+    # 必须在去重循环之前拦截（循环本身是 O(n²)）。axis/结构化/
+    # StringDType/MaskedArray/多维走原 Python 路径；复数/空数组内核
+    # 返回 Err 亦回退。
+    if (fields is None and _ax is None and not _is_vstr
+            and _ma_input is None and ndim == 1
+            and str(dtype).startswith(('float', 'int', 'u', 'b', 'f', 'i'))):
+        try:
+            v_raw, first_raw, inv_raw, cnt_raw = _core.unique_1d_core(
+                arr._array, bool(equal_nan), bool(sorted))
+            uniq_arr = nd._wrap(v_raw).astype(dtype)
+            if uniq_arr.__class__ is not arr.__class__:
+                uniq_arr.__class__ = arr.__class__
+            if not (return_index or return_inverse or return_counts):
+                return uniq_arr
+            _outs = [uniq_arr]
+            if return_index:
+                _outs.append(nd._wrap(first_raw).astype('int64'))
+            if return_inverse:
+                _outs.append(nd._wrap(inv_raw).astype('int64'))
+            if return_counts:
+                _outs.append(nd._wrap(cnt_raw).astype('int64'))
+            return tuple(_outs)
+        except Exception:
+            pass
+
     def _same_elem(x, y):
         # NA 对象 / NaN：仅 equal_nan=True 时相等——先于身份短路判定，
         # 使 equal_nan=False 时多个 NA 保持独立（即使是同一实例）
