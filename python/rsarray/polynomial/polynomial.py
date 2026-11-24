@@ -10,7 +10,7 @@ deg 幂列表、__array_function__ 派发按 2.x 语义实现。
 import builtins
 import itertools as _itertools
 
-__all__ = [
+__all__ = [  # noqa: F822
     'polyzero', 'polyone', 'polyx', 'polydomain',
     'polyval', 'polyvalfromroots', 'polyval2d', 'polyval3d', 'polyvalnd',
     'polygrid2d', 'polygrid3d',
@@ -190,6 +190,14 @@ def polyval(x, c, tensor=True):
         if _is_py_scalar(x):
             return _pyval(cvals, x)
         xarr = NX.asanyarray(x)
+        # float 输入：core 直连（Rust Horner 单遍，避免逐系数整数组 dispatch）；
+        # int 输入保持原路径（Python int 精确算术，避免 f64 2^53 精度损失）
+        if str(getattr(xarr, '_dtype', ''))[:1] == 'f' \
+                and str(getattr(c, '_dtype', ''))[:1] == 'f':
+            try:
+                return _wrap(_core().polyval1d_core(xarr._array, c._array))
+            except Exception:
+                pass
         y = NX.zeros_like(xarr)
         for pv in reversed(cvals):
             y = y * xarr + pv
@@ -348,7 +356,7 @@ def polyder(c, m=1, scl=1, axis=0):
     if c.ndim == 1:
         return NX.array(_der1d(c.tolist(), m, scl))
     ax = 0 if axis is None else axis
-    fn = lambda v: _der1d(v, m, scl)
+    fn = lambda v: _der1d(v, m, scl)  # noqa: E731
     return _apply_along_axis(c, fn, ax)
 
 
@@ -375,7 +383,7 @@ def polyint(c, m=1, k=[], lbnd=0, scl=1, axis=0):
     if c.ndim == 1:
         return NX.array(_int1d(c.tolist(), m, klist, lbnd, scl))
     ax = 0 if axis is None else axis
-    fn = lambda v: _int1d(v, m, klist, lbnd, scl)
+    fn = lambda v: _int1d(v, m, klist, lbnd, scl)  # noqa: E731
     return _apply_along_axis(c, fn, ax)
 
 

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 import builtins
 import itertools
-import math
+from collections import namedtuple
 
 """数组操作模块 - 所有实现位于 Rust，这里仅保留薄包装。"""
 
@@ -272,38 +272,9 @@ def broadcast_to(a, shape, subok=None, device=None):
         if _shp:
             _out = _out.reshape(_shp)
         return _out
-    # Rust _core.broadcast_to 对复数丢虚部（与 _core.prod 复数 bug 同源）：
-    # 复数 dtype 走 Python 侧物化（tolist 保留复数）。
-    if isinstance(dtype, str) and dtype.startswith('complex') \
-            and getattr(arr, '_array', None) is not None:
-        _shp = ((int(shape),) if (isinstance(shape, int) or _scalar_idx(shape))
-                else tuple(int(s) for s in shape))
-        _src = arr.tolist()
-        _src_shape = tuple(arr.shape)
-        _off = len(_shp) - len(_src_shape)
-        _total = 1
-        for _s in _shp:
-            _total *= _s
-        _out = []
-        for _t in range(_total):
-            _idx = []
-            _rem = _t
-            for _s in reversed(_shp):
-                _idx.append(_rem % _s)
-                _rem //= _s
-            _idx = list(reversed(_idx))
-            _v = _src
-            for _j, _s in enumerate(_src_shape):
-                _v = _v[_idx[_off + _j] % _s]
-            _out.append(_v)
-        if not _shp:
-            _res = nd(_out[0])
-            _res._dtype = dtype
-            return _res
-        _res = nd(_out).reshape(_shp)
-        if getattr(_res, '_dtype', None) != dtype:
-            _res = _res.astype(dtype)
-        return _res
+    # 复数 dtype 也走下方通用路径：Rust _core.broadcast_to 已带实/虚双通道
+    # （imag 同步广播，零 list 往返）；旧版 Python 物化路径（% 回绕语义，
+    # 非标准广播）已废弃。
     # Handle broadcasting to scalar shape ()
     if shape == () or shape == []:
         result = arr._array  # 0-d array is already scalar-shaped
@@ -1044,6 +1015,10 @@ def tile(A, reps):
     if getattr(arr, 'size', 0) == 0:
         new_sh = tuple(r * s for r, s in zip(reps, tuple(out.shape)))
         return _np().zeros(new_sh, dtype=getattr(arr, '_dtype', None) or 'float64')
+    # 注：tile_core 单趟 core 拷贝实测比 concatenate 链慢 ~4.5x
+    # （逐元素索引运算 vs 块 memcpy），且下方循环仅 nd 次迭代、
+    # 主体拷贝本已 Rust 支撑，非真热点——不接 fast path
+    # （tile_core 保留在 Rust 侧，供未来 odometer 化后复用）。
     for i, r in enumerate(reps):
         if r == 1:
             continue
@@ -1053,7 +1028,13 @@ def tile(A, reps):
             out = out[tuple(sl)]
         else:
             out = _np().concatenate([out] * r, axis=i)
-    return _wrap(_ensure_raw(out))
+    result = _wrap(_ensure_raw(out))
+    # 整型/布尔输入保 dtype 标签（raw 重包会回落 float64，数组语义须保留）
+    _dt = getattr(arr, '_dtype', None)
+    if _dt is not None and str(_dt)[:1] in ('i', 'u', 'b') \
+            and getattr(result, '_dtype', None) != _dt:
+        result._dtype = _dt
+    return result
 
 
 def repeat(a, repeats, axis=None):
@@ -1554,7 +1535,6 @@ def unique(a, return_index=False, return_inverse=False, return_counts=False,
 
 
 # ========== Array API 风格的 unique 包装 ==========
-from collections import namedtuple
 
 _UniqueInv = namedtuple("UniqueAll", ["values", "inverse_indices"])
 _UniqueAll = namedtuple("UniqueAll", ["values", "indices",

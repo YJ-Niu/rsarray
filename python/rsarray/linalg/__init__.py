@@ -21,8 +21,26 @@ SlogdetResult = namedtuple('SlogdetResult', ['sign', 'logabsdet'])
 
 
 class LinAlgError(ValueError):
-    """线性代数相关错误。"""
-    pass
+    """线性代数相关错误。
+    常见触发场景：
+    - 矩阵奇异 / 不可逆（inv、solve、matrix_power 等）
+    - 输入含 inf/nan（模拟 LAPACK 不收敛，如 svd、cholesky）
+    - 维度不匹配 / 非方阵 / 空数组（如 lstsq、cond）
+    - Cholesky 分解遇到非正定矩阵
+
+    【使用示例】
+    >>> import rsarray as np
+    >>> np.linalg.inv(np.array([[1., 2.], [2., 4.]]))  # 奇异矩阵
+    Traceback (most recent call last):
+        ...
+    rsarray.linalg.LinAlgError: Singular matrix
+
+    >>> try:
+    ...     np.linalg.solve(np.array([[0., 0.]]), np.array([1.]))
+    ... except ValueError as e:  # 可按 ValueError 捕获（numpy 2.x 语义）
+    ...     print(type(e).__name__, e)
+    LinAlgError solve: last 2 dimensions of `a` must be square
+    """
 
 
 def _ensure(x):
@@ -34,7 +52,12 @@ def _ensure(x):
 
 
 def _round_float(v):
-    """对浮点数进行四舍五入，避免出现 .999999999999999 等精度问题。"""
+    """对浮点数进行四舍五入，避免出现 .999999999999999 等精度问题。
+
+    complex 无 __round__，直接放行（复数不做近整取整）。
+    """
+    if isinstance(v, complex):
+        return v
     if abs(v - round(v)) < 1e-10:
         return round(v)
     return v
@@ -629,7 +652,17 @@ def _norm_mat(M, ord):
         rowsums = [sum(row) for row in absM]
         return max(rowsums) if ord == float('inf') else min(rowsums)
     if ord in (2, -2, 'nuc'):
-        svals = [float(abs(v)) for v in _svd_jacobi(M, False, False).tolist()]
+        svals = None
+        try:
+            from rsarray import ndarray
+            svals = [float(abs(v)) for v in ndarray._wrap(
+                _core.linalg.svd_jacobi_sig(
+                    ndarray(M)._array)).tolist()]
+        except Exception:
+            svals = None
+        if svals is None:
+            svals = [float(abs(v)) for v in
+                     _svd_jacobi(M, False, False).tolist()]
         if not svals:
             return 0.0
         if ord == 2:
@@ -926,8 +959,8 @@ class linalg_module:
         if n == 0:
             return _as_result(ndarray([]).astype(res_dt).reshape(shape))
         if len(shape) == 2:
-            # Rust 快路径仅 2x2/3x3 实输入；1x1/大尺寸/复数走纯 Python
-            # 高斯-约当（列主元）。
+            # Rust 快路径仅 2x2/3x3 实输入；1x1/大尺寸/复数走 core
+            # gj_solve（任意尺寸、复数），纯 Python 高斯-约当兜底。
             if not _is_complex_arr(a_arr) and n in (2, 3):
                 try:
                     return _as_result(
@@ -935,10 +968,27 @@ class linalg_module:
                             res_dt))
                 except ValueError:
                     pass
-            return _as_result(
-                ndarray(_gauss_jordan_inv(a_arr.tolist())).astype(res_dt))
+            try:
+                return _as_result(_wrap(
+                    _core.linalg.gj_solve_core(a_arr._array, None))
+                    .astype(res_dt))
+            except ValueError:
+                # 奇异（或核心异常）→ 纯 Python 高斯-约当
+                # （奇异时同样抛 LinAlgError）
+                return _as_result(
+                    ndarray(_gauss_jordan_inv(a_arr.tolist())).astype(
+                        res_dt))
         lead, subs = _stacked_2d(a_arr)
-        out = [_gauss_jordan_inv(sub.tolist()) for sub in subs]
+        out = []
+        for sub in subs:
+            try:
+                out.append(_wrap(
+                    _core.linalg.gj_solve_core(sub._array, None)).tolist())
+            except ValueError:
+                # 核心异常（通常奇异）→ 整体回退纯 Python
+                return _as_result(ndarray(
+                    [_gauss_jordan_inv(s.tolist()) for s in subs]
+                ).astype(res_dt).reshape(shape))
         return _as_result(ndarray(out).astype(res_dt).reshape(shape))
 
     @staticmethod
@@ -1166,6 +1216,13 @@ class linalg_module:
                         _ensure(A), _ensure(B))).tolist()
                 except ValueError:
                     pass
+            # core gj（任意尺寸、复数）；奇异 → ValueError，
+            # 落到纯 Python（奇异同样走 pinv 兜底）
+            try:
+                return _wrap(_core.linalg.gj_solve_core(
+                    _ensure(A), _ensure(B))).tolist()
+            except ValueError:
+                pass
             b_rows = B.tolist()
             if b1d:
                 b_rows = [[v] for v in b_rows]
@@ -1298,15 +1355,29 @@ class linalg_module:
         _scan_nonfinite(a_rows)
         _scan_nonfinite(b_rows)
 
-        u, s, vt = linalg_module.svd(a_arr, full_matrices=False)
-        s_list = [float(abs(v)) for v in s.tolist()]
-
         if rcond is None:
             rcond_val = 1.0e-15
         elif rcond < 0:
             rcond_val = _finfo_eps(s_dt)
         else:
             rcond_val = float(rcond)
+
+        # core svd_assemble（内部 Jacobi SVD + 组装 + 残差，消除全部
+        # tolist 往返）；异常/空尺寸回退纯 Python
+        if m > 0:
+            try:
+                x_raw, res_raw, rank_c, s_raw = \
+                    _core.linalg.svd_assemble_core(
+                        a_arr._array, b_arr._array, rcond_val, 1)
+                x = ndarray._wrap(x_raw).astype(res_dt)
+                res = ndarray._wrap(res_raw).astype(s_dt)
+                s_out = ndarray._wrap(s_raw).astype(s_dt)
+                return (x, res, rank_c, s_out)
+            except Exception:
+                pass
+
+        u, s, vt = linalg_module.svd(a_arr, full_matrices=False)
+        s_list = [float(abs(v)) for v in s.tolist()]
         s_max = max(s_list) if s_list else 0.0
         cutoff = rcond_val * s_max
         rank = int(sum(1 for v in s_list if v > cutoff))
@@ -1535,9 +1606,46 @@ class linalg_module:
             except ValueError:
                 pass
         lead, subs = _stacked_2d(a_arr)
+        # core QR 迭代（n≥9 大矩阵热点；n≤8 的 FL+DK 小矩阵留 Python，
+        # 不收敛 → core 返回 Err 回退纯 Python 旧行为下界）
+        # 批量 core：n≥9 时 stacked 一次 FFI 内逐批 QR 迭代（消除逐批
+        # 内核调用 + wrap/tolist 往返）；n<9 或失败批回退纯 Python
         if len(shape) == 2:
+            if shape[-1] >= 9:
+                try:
+                    return _wrap(
+                        _core.linalg.eigvals_qr_core(a_arr._array)
+                    ).astype(out_dt)
+                except Exception:
+                    pass
             return ndarray(_eigvals_qr(a_arr.tolist())).astype(out_dt)
-        evals_list = [_eigvals_qr(sub.tolist()) for sub in subs]
+        if shape[-1] >= 9:
+            try:
+                flat_evals, batch_ok = _core.linalg.eigvals_qr_batch_core(
+                    a_arr._array)
+                flat_list = ndarray._wrap(flat_evals).tolist()
+                ok_list = ndarray._wrap(batch_ok).tolist()
+                if all(ok_list):
+                    return ndarray(flat_list).reshape(
+                        lead + (shape[-1],)).astype(out_dt)
+                # 失败批逐个回退纯 Python（FL+DK 旧行为下界）
+                for i, good in enumerate(ok_list):
+                    if not good:
+                        flat_list[i] = _eigvals_qr(subs[i].tolist())
+                return ndarray(flat_list).reshape(
+                    lead + (shape[-1],)).astype(out_dt)
+            except Exception:
+                pass
+        evals_list = []
+        for sub in subs:
+            if sub.shape[-1] >= 9:
+                try:
+                    evals_list.append(
+                        _core.linalg.eigvals_qr_core(sub._array))
+                    continue
+                except Exception:
+                    pass
+            evals_list.append(ndarray(_eigvals_qr(sub.tolist())))
         return ndarray(evals_list).reshape(lead + (shape[-1],)) \
             .astype(out_dt)
 
@@ -1652,8 +1760,20 @@ class linalg_module:
                              s.reshape(lead + tuple(results[0].S.shape)),
                              vt.reshape(lead + tuple(results[0].Vh.shape)))
 
+        def _core_ok(sub):
+            # core Jacobi SVD：2-d 非空矩阵（实数/复数；空/异常回退
+            # 纯 Python Jacobi）
+            return sub.ndim == 2 and sub.size > 0
+
         def _one(sub):
             if not compute_uv:
+                if _core_ok(sub):
+                    try:
+                        s = ndarray._wrap(
+                            _core.linalg.svd_jacobi_sig(sub._array))
+                        return s.astype(s_dt)
+                    except Exception:
+                        pass
                 s = _svd_jacobi(sub.tolist(), False, False)
                 return s.astype(s_dt)
             # Rust 2x2 SVD 只处理实输入（复数输入返回实 U/Vh，结果错误），
@@ -1672,6 +1792,15 @@ class linalg_module:
                         s_list = [row[i] for i, row in enumerate(s_list)]
                     return SVDResult(ndarray._wrap(u).astype(res_dt),
                                      ndarray(s_list).astype(s_dt),
+                                     ndarray._wrap(vt).astype(res_dt))
+                except Exception:
+                    pass
+            if _core_ok(sub):
+                try:
+                    u, s, vt = _core.linalg.svd_jacobi_uv(
+                        sub._array, full_matrices)
+                    return SVDResult(ndarray._wrap(u).astype(res_dt),
+                                     ndarray._wrap(s).astype(s_dt),
                                      ndarray._wrap(vt).astype(res_dt))
                 except Exception:
                     pass
@@ -1771,6 +1900,19 @@ class linalg_module:
                     r = _round_array(r)
                     return (ndarray._wrap(q).astype(res_dt),
                             ndarray._wrap(r).astype(res_dt))
+                except Exception:
+                    pass
+            # core Householder QR（任意尺寸实/复，消除 tolist 往返）；
+            # raw 语义不同（_qr_raw 的 H/tau）不走；异常回退纯 Python
+            if mode != 'raw':
+                try:
+                    q_raw, r_raw = _core.linalg.qr_householder_core(
+                        sub._array, mode == 'complete')
+                    q = ndarray._wrap(q_raw).astype(res_dt)
+                    r = ndarray._wrap(r_raw).astype(res_dt)
+                    if mode == 'r':
+                        return r
+                    return (q, r)
                 except Exception:
                     pass
             q, r = linalg_module._qr_householder(
@@ -2033,32 +2175,58 @@ class linalg_module:
             m, n = a_arr.shape[-2:]
             return empty(a_arr.shape[:-2] + (n, m), dtype=res_dt)
 
-        # A^+ = V Σ^+ U^H，其中 (U, s, Vh) = svd(A, full_matrices=False)
-        #（对 A 本身做 SVD；_one 按 V[i,j]=vt[j,i].conj() 组装）
+        # A^+ = V Σ^+ U^H：core svd_assemble（内部复用已验证的 Jacobi
+        # SVD，任意尺寸实/复数，消除全部 tolist 往返）；hermitian/
+        # 空尺寸/异常回退 svd + 纯 Python 组装
+        shape = a_arr.shape
+        m, n = shape[-2], shape[-1]
+        if not hermitian and m > 0 and n > 0:
+            try:
+                if len(shape) == 2:
+                    return ndarray._wrap(
+                        _core.linalg.svd_assemble_core(
+                            a_arr._array, None, rcond_val, 0)[0]
+                    ).astype(res_dt)
+                lead = shape[:-2]
+                total = 1
+                for d in lead:
+                    total *= d
+                flat = a_arr.reshape((total, m, n))
+                parts = []
+                for i in range(total):
+                    parts.append(ndarray._wrap(
+                        _core.linalg.svd_assemble_core(
+                            flat[i]._array, None, rcond_val, 0)[0])
+                        .tolist())
+                return ndarray(parts).reshape(lead + (n, m)).astype(res_dt)
+            except Exception:
+                pass
+
+        # 兜底：(U, s, Vh) = svd(A, full_matrices=False)，_one 按
+        # V[i,j]=vt[j,i].conj() 组装
         u, s, vt = linalg_module.svd(a_arr, full_matrices=False,
                                      hermitian=hermitian)
 
         def _one(u_m, s_list, vt_k):
-            m = len(u_m)
-            n = len(vt_k[0]) if vt_k else 0
+            mm = len(u_m)
+            nn = len(vt_k[0]) if vt_k else 0
             k = len(s_list)
             s_max = max(s_list) if s_list else 0.0
             cutoff = float(rcond_val) * s_max
-            res = [[0.0] * m for _ in range(n)]
+            res = [[0.0] * mm for _ in range(nn)]
             for j in range(k):
                 si = (1.0 / s_list[j]) if s_list[j] > cutoff else 0.0
                 if si == 0.0:
                     continue
-                for i in range(n):
+                for i in range(nn):
                     vij = vt_k[j][i].conjugate() * si
                     if vij == 0:
                         continue
                     res_i = res[i]
-                    for r in range(m):
+                    for r in range(mm):
                         res_i[r] += vij * u_m[r][j].conjugate()
             return res
 
-        shape = a_arr.shape
         if len(shape) == 2:
             res = _one(u.tolist(), s.tolist(), vt.tolist())
             return ndarray(res).astype(res_dt)
@@ -2072,7 +2240,6 @@ class linalg_module:
         parts = [_one(flat_u[i].tolist(), flat_s[i].tolist(),
                       flat_vt[i].tolist())
                  for i in range(flat_u.shape[0])]
-        m, n = shape[-2], shape[-1]
         return ndarray(parts).reshape(lead + (n, m)).astype(res_dt)
 
     @staticmethod
@@ -2231,8 +2398,16 @@ class linalg_module:
                 try:
                     s = linalg_module.svd(sub, compute_uv=False).tolist()
                 except Exception:
-                    s = [float(abs(v)) for v in
-                         _svd_jacobi(sub.tolist(), False, False).tolist()]
+                    s = None
+                    try:
+                        from rsarray import ndarray
+                        s = [float(abs(v)) for v in ndarray._wrap(
+                            _core.linalg.svd_jacobi_sig(
+                                sub._array)).tolist()]
+                    except Exception:
+                        s = [float(abs(v)) for v in
+                             _svd_jacobi(sub.tolist(),
+                                         False, False).tolist()]
                 if not s:
                     r = float('nan')
                 elif p == -2:

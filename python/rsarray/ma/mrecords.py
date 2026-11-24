@@ -6,7 +6,7 @@ MaskedRecords：基于结构化（记录）数据的掩码数组；逐记录访�
 """
 
 import rsarray as np
-from .core import MaskedArray, asarray, getmaskarray, nomask
+from .core import MaskedArray, asarray
 
 
 class _MaskedRecord(tuple):

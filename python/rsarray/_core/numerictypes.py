@@ -4,16 +4,17 @@
 对齐 2.x 语义；与更新版 行为不一致处（如 ``sctype2char(1)``
 抛 ValueError）以 rsarray 测试契约为准。
 """
-
-__all__ = [
-    'sctypes', 'sctypeDict', 'typeDict', 'typecodes',
-    'issctype', 'obj2sctype', 'sctype2char',
-    'bool', 'int', 'float', 'complex', 'str', 'bytes', 'object',
-]
-
 from builtins import bytes, complex, float, int, object, str  # noqa: F401
 # 注意：bool 不从此处导入——nt.bool 必须指向 rsarray 标量类（参考实现
 # numerictypes 语义），由模块 __getattr__ 回落到 rsarray.bool。
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # sctypes/sctypeDict/typeDict/typecodes 经 PEP 562 __getattr__ 按需构造
+    # （构造需完整加载 rsarray，导入期赋值会循环导入）；此占位赋值仅为
+    # 静态分析提供绑定，消除 "__all__ 中未定义名字" 告警，运行时不执行。
+    sctypes = sctypeDict = typeDict = typecodes = None
 
 _TYPECODES = {
     'Character': 'c',
@@ -231,3 +232,10 @@ def sctype2char(sctype):
     if sc not in d.values():
         raise KeyError(sc)
     return _type_char(sc)
+
+
+__all__ = [
+    'sctypes', 'sctypeDict', 'typeDict', 'typecodes',
+    'issctype', 'obj2sctype', 'sctype2char',
+    'bool', 'int', 'float', 'complex', 'str', 'bytes', 'object',
+]

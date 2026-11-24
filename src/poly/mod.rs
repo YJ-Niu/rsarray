@@ -721,8 +721,44 @@ fn polyvalnd_core(c: &NdArray, pts: Vec<NdArray>, bshape: Vec<usize>) -> PyResul
     })
 }
 
+/// 一维多项式求值（Horner，升序系数 c）：out[k] = Σ_i c[i] * x[k]^i。
+/// 输出形状 = x 的形状（任意布局，按逻辑序）。复数输入 → TypeError
+/// （Python 侧回退）；c 须一维。
+#[pyfunction]
+fn polyval1d_core(x: &NdArray, c: &NdArray) -> PyResult<NdArray> {
+    if x.imag.is_some() || c.imag.is_some() {
+        return Err(PyTypeError::new_err(
+            "polyval complex not supported in core path",
+        ));
+    }
+    if c.data.ndim() != 1 {
+        return Err(PyValueError::new_err("polyval: coefficients must be 1-D"));
+    }
+    let xv: Vec<f64> = x.data.iter().copied().collect();
+    let cv: Vec<f64> = c.data.iter().copied().collect();
+    if cv.is_empty() {
+        return Err(PyValueError::new_err("polyval: empty coefficients"));
+    }
+    let xshape: Vec<usize> = x.data.shape().to_vec();
+    let mut out = vec![0.0f64; xv.len()];
+    for (k, &xk) in xv.iter().enumerate() {
+        let mut y = 0.0f64;
+        for &cvi in cv.iter().rev() {
+            y = y * xk + cvi;
+        }
+        out[k] = y;
+    }
+    let data = Array::from_shape_vec(IxDyn(&xshape), out)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        imag: None,
+        data: data.into_dyn(),
+    })
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(polyval_rs, m)?)?;
+    m.add_function(wrap_pyfunction!(polyval1d_core, m)?)?;
     m.add_function(wrap_pyfunction!(polyder_rs, m)?)?;
     m.add_function(wrap_pyfunction!(polyint_rs, m)?)?;
     m.add_function(wrap_pyfunction!(polyroots_rs, m)?)?;

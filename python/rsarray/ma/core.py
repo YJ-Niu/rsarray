@@ -218,7 +218,7 @@ class MaskedArray:
         """返回独立副本（data 与 mask 均拷贝）。"""
         return MaskedArray(self._data.copy(), list(self._mask))
 
-    def _as_fill(self, fv):
+    def _as_fill(self, fv):  # noqa: F811
         """fill_value 规范化：按 data dtype 存为 0-d 数组（ma 语义：
         x.fill_value.dtype == x.dtype；不可转换则存原值）。"""
         if fv is None:
@@ -267,7 +267,6 @@ class MaskedArray:
     def _ma_extreme(self, which, axis=None):
         """掩码感知 min/max：掩码位填 ±inf 后归约（ma 语义：忽略
         masked 元素）。axis=None 返回 0-d MaskedArray；axis 返回轴归约。"""
-        import math as _math
         d = self._data
         shp = tuple(d.shape)
         msk = np.array(self._mask, dtype='bool')
@@ -315,6 +314,7 @@ class MaskedArray:
             _of = [1 if v == fillv else 0 for v in red] if not out_shp \
                 else None
             # 逐行掩码：构造行掩码嵌套
+
             def rowmask(flat, dims):
                 if not dims:
                     return flat[0]
@@ -1269,7 +1269,7 @@ maximum = _ma_minmax('maximum', False)
 
 # 遗留别名：product = prod。np.product 在顶层于 ma 导入之后才挂载，
 # _copy_names 时尚不可见，这里显式补齐。
-product = prod
+product = prod  # noqa: F821
 
 
 # ---- 精确签名函数（测试用 inspect.signature 断言；须位于 _copy_names
@@ -1317,8 +1317,7 @@ def compress(condition, a, axis=None, out=None):
                        fill_value=a.fill_value)
 
 
-def empty(shape, dtype=None, order='C', *, device=None, like=None,
-          fill_value=None, hardmask=False):
+def empty(shape, dtype=None, order='C', *, device=None, like=None, fill_value=None, hardmask=False):  # noqa: F811
     """掩码空数组（ma.empty 兼容；精确签名）。"""
     _ = order, device, like, hardmask
     arr = np.empty(shape, dtype=dtype)
@@ -1330,8 +1329,7 @@ def empty(shape, dtype=None, order='C', *, device=None, like=None,
     return MaskedArray(arr, mask=False, fill_value=fv)
 
 
-def empty_like(prototype, /, dtype=None, order='K', subok=True,
-               shape=None, *, device=None):
+def empty_like(prototype, /, dtype=None, order='K', subok=True, shape=None, *, device=None):  # noqa: F811
     """同形状掩码空数组（ma.empty_like 兼容；精确签名）。"""
     _ = order, subok, device
     proto = prototype.data if isinstance(prototype, MaskedArray) else prototype

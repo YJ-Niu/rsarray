@@ -81,7 +81,7 @@ def _flatiter_index_get(self):
 class flatiter:
     """数组的扁平迭代器（rsarray._core.flatiter 兼容）。
 
-    支持索引、切片、迭代与 ``index`` 属性（docstring 契约与 
+    支持索引、切片、迭代与 ``index`` 属性（docstring 契约与
     一致，且不可被 add_newdoc 改写——模拟 C 层 getset 行为）。
     """
 

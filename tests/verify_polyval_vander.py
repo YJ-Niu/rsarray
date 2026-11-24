@@ -273,6 +273,44 @@ def test_polygrid2d():
 
 # ===================== 性能 =====================
 
+def test_polyval_1d():
+    def ref_h(cvals, xvals):
+        out = []
+        for v in xvals:
+            y = 0.0
+            for p in reversed(cvals):
+                y = y * v + p
+            out.append(y)
+        return out
+    cvals = [1.0, -2.0, 0.5, 3.0]
+    c = np.array(cvals)
+    xvals = [0.0, 1.0, -1.5, 2.0, 10.0]
+    x = np.array(xvals)
+    # 1-D float
+    got = P.polyval(x, c)
+    check("polyval 1d", grids_match(got, ref_h(cvals, xvals), (5,)))
+    # 2-D x（形状保持，C 序展平对照）
+    got = P.polyval(np.array([[1.0, 2.0], [3.0, -1.0]]), c)
+    check("polyval 1d 2d-x", grids_match(
+        got, ref_h(cvals, [1.0, 2.0, 3.0, -1.0]), (2, 2)))
+    # 0-D x
+    got = P.polyval(np.array(2.5), c)
+    y0 = 0.0
+    for p in reversed(cvals):
+        y0 = y0 * 2.5 + p
+    check("polyval 1d 0d-x", abs(float(got.tolist()) - y0) < 1e-12)
+    # int 输入 → 原路径（Python int 精确算术）
+    got = P.polyval(np.array([1, 2, 3, 10]), np.array([1, 2, 3]))
+    refi = [1 + 2 * v + 3 * v * v for v in (1, 2, 3, 10)]
+    check("polyval 1d int", grids_match(got, refi, (4,)))
+    # deg 0 / deg 1
+    got = P.polyval(x, np.array([7.0]))
+    check("polyval 1d deg0", grids_match(got, [7.0] * 5, (5,)))
+    got = P.polyval(x, np.array([3.0, 2.0]))
+    check("polyval 1d deg1",
+          grids_match(got, [3.0 + 2.0 * v for v in xvals], (5,)))
+
+
 def bench_polyvalnd():
     n = 200
     x = np.random.rand(n, n)
@@ -353,14 +391,38 @@ def bench_polyvander2d():
           f"rust={t_new*1e3:.1f}ms ref={len(ref)} values")
 
 
+def bench_polyval():
+    import random
+    n = 1_000_000
+    xs = [random.random() for _ in range(n)]
+    cs = [random.random() for _ in range(199)]
+    x = np.array(xs)
+    c = np.array(cs)
+    t0 = time.perf_counter()
+    got = P.polyval(x, c)
+    t_new = time.perf_counter() - t0
+    check("polyval bench shape", tuple(got.shape) == (n,))
+    ok = True
+    for k in (0, 12345, n // 2, n - 1):
+        y = 0.0
+        for p in reversed(cs):
+            y = y * xs[k] + p
+        if abs(float(got[k]) - y) > 1e-9 * max(1.0, abs(y)):
+            ok = False
+    check("polyval bench values", ok)
+    print(f"BENCH polyval n={n} deg=198: rust={t_new*1e3:.1f}ms")
+
+
 def main():
     test_polyvander()
+    test_polyval_1d()
     test_polyvander2d()
     test_polyvander3d()
     test_polyval2d()
     test_polyval3d()
     test_polyvalnd_direct()
     test_polygrid2d()
+    bench_polyval()
     bench_polyvalnd()
     bench_polyvander()
     bench_polyvander2d()

@@ -1498,17 +1498,23 @@ fn svd(a: &NdArray) -> PyResult<(NdArray, NdArray, NdArray)> {
     let lambda2 = (tr - sqrt_disc) / 2.0;
     let sigma1 = lambda1.sqrt();
     let sigma2 = lambda2.sqrt();
+    // b12 == 0（A^T A 已对角）时特征向量是 e1/e2：λ1 对应 max(b11, b22)
+    // 的方向——固定取 e1 会使 U/Vh 与降序 s 不配套（如 diag(2,4)）
     let (v1x, v1y) = if b12.abs() > 1e-12 {
         (b12, lambda1 - b11)
-    } else {
+    } else if b11 >= b22 {
         (1.0, 0.0)
+    } else {
+        (0.0, 1.0)
     };
     let v1_norm = (v1x * v1x + v1y * v1y).sqrt();
     let (v1x, v1y) = (v1x / v1_norm, v1y / v1_norm);
     let (v2x, v2y) = if b12.abs() > 1e-12 {
         (b12, lambda2 - b11)
-    } else {
+    } else if b11 >= b22 {
         (0.0, 1.0)
+    } else {
+        (1.0, 0.0)
     };
     let v2_norm = (v2x * v2x + v2y * v2y).sqrt();
     let (v2x, v2y) = (v2x / v2_norm, v2y / v2_norm);
@@ -1938,6 +1944,1503 @@ fn solve_banded(lower: usize, upper: usize, ab: &NdArray, b: &NdArray) -> PyResu
     solve(&full_nd, b)
 }
 
+/// 复数幅值（hypot，与 Python abs(complex) 一致）
+#[inline]
+fn gj_mag(z: (f64, f64)) -> f64 {
+    z.0.hypot(z.1)
+}
+
+/// 复数除法（朴素公式 (ac+bd)/m + (bc-ad)/m，m = c²+d²）
+#[inline]
+fn gj_cdiv(x: (f64, f64), y: (f64, f64)) -> (f64, f64) {
+    let m = y.0 * y.0 + y.1 * y.1;
+    ((x.0 * y.0 + x.1 * y.1) / m, (x.1 * y.0 - x.0 * y.1) / m)
+}
+
+/// a - f*w（f*w 先乘后减，运算次序与 Python complex 一致）
+#[inline]
+fn gj_csub_mul(a: (f64, f64), f: (f64, f64), w: (f64, f64)) -> (f64, f64) {
+    (a.0 - (f.0 * w.0 - f.1 * w.1), a.1 - (f.0 * w.1 + f.1 * w.0))
+}
+
+/// 高斯-约当消元核心：解 Ax=b（列主元，任意 n、k 个右端）。
+/// b=None → 右端为单位阵（即矩阵求逆）。语义与 Python
+/// _gauss_jordan_solve/_gauss_jordan_inv 对齐：eps = n * max|A| * 2.22e-16
+/// （max|A|==0 → 1e-10，且 max|A| 只统计 A）；主元为严格大于扫描
+/// （并列取最先，NaN 不会胜过既有最优）；奇异 → Err("Singular matrix")；
+/// 消元跳过 factor==0 的行。元素统一 (re, im) 对，实数输入 im=0。
+#[pyfunction]
+#[pyo3(signature = (a, b=None))]
+fn gj_solve_core(a: &NdArray, b: Option<&NdArray>) -> PyResult<NdArray> {
+    let a_shape: Vec<usize> = a.data.shape().to_vec();
+    if a_shape.len() != 2 || a_shape[0] != a_shape[1] {
+        return Err(PyValueError::new_err(
+            "gj_solve_core: a must be square (n, n)",
+        ));
+    }
+    let n = a_shape[0];
+    let k = match &b {
+        None => n,
+        Some(b) => match b.data.shape().to_vec().as_slice() {
+            [m] if *m == n => 1,
+            [m, kk] if *m == n => *kk,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "gj_solve_core: b must be (n,) or (n, k)",
+                ));
+            }
+        },
+    };
+    let complex = a.imag.is_some() || b.is_some_and(|x| x.imag.is_some());
+    // 读入（逻辑 C 序展平，任意布局安全）
+    let mut work: Vec<(f64, f64)> = a.data.iter().map(|&r| (r, 0.0)).collect();
+    if let Some(im) = &a.imag {
+        for (w, &i) in work.iter_mut().zip(im.iter()) {
+            w.1 = i;
+        }
+    }
+    let mut rhs: Vec<(f64, f64)>;
+    if let Some(b) = b {
+        rhs = b.data.iter().map(|&r| (r, 0.0)).collect();
+        if let Some(im) = &b.imag {
+            for (w, &i) in rhs.iter_mut().zip(im.iter()) {
+                w.1 = i;
+            }
+        }
+    } else {
+        rhs = (0..n * n)
+            .map(|p| {
+                let (i, j) = (p / n, p % n);
+                (if i == j { 1.0 } else { 0.0 }, 0.0)
+            })
+            .collect();
+    }
+    let max_abs = work.iter().map(|z| gj_mag(*z)).fold(0.0f64, f64::max);
+    let eps = if max_abs != 0.0 {
+        n as f64 * max_abs * 2.220446049250313e-16
+    } else {
+        1e-10
+    };
+    for col in 0..n {
+        let mut pivot = col;
+        let mut best = gj_mag(work[col * n + col]);
+        for r in (col + 1)..n {
+            let v = gj_mag(work[r * n + col]);
+            if v > best {
+                best = v;
+                pivot = r;
+            }
+        }
+        if best < eps {
+            return Err(PyValueError::new_err("Singular matrix"));
+        }
+        if pivot != col {
+            for j in 0..n {
+                work.swap(col * n + j, pivot * n + j);
+            }
+            for j in 0..k {
+                rhs.swap(col * k + j, pivot * k + j);
+            }
+        }
+        let pv = work[col * n + col];
+        for j in 0..n {
+            work[col * n + j] = gj_cdiv(work[col * n + j], pv);
+        }
+        for j in 0..k {
+            rhs[col * k + j] = gj_cdiv(rhs[col * k + j], pv);
+        }
+        for r in 0..n {
+            if r == col {
+                continue;
+            }
+            let factor = work[r * n + col];
+            if factor.0 == 0.0 && factor.1 == 0.0 {
+                continue;
+            }
+            for j in 0..n {
+                let w = work[col * n + j];
+                work[r * n + j] = gj_csub_mul(work[r * n + j], factor, w);
+            }
+            for j in 0..k {
+                let w = rhs[col * k + j];
+                rhs[r * k + j] = gj_csub_mul(rhs[r * k + j], factor, w);
+            }
+        }
+    }
+    let out_real: Vec<f64> = rhs.iter().map(|z| z.0).collect();
+    let data = Array::from_shape_vec(IxDyn(&[n, k]), out_real)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let imag = if complex {
+        let v: Vec<f64> = rhs.iter().map(|z| z.1).collect();
+        Some(
+            Array::from_shape_vec(IxDyn(&[n, k]), v)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    Ok(NdArray { data, imag })
+}
+
+/// 列内积（实数，C 序 flat 访问）
+fn jcol_dot(work: &[f64], mm: usize, nn: usize, p: usize, q: usize) -> f64 {
+    let mut s = 0.0;
+    for i in 0..mm {
+        s += work[i * nn + p] * work[i * nn + q];
+    }
+    s
+}
+
+/// 复共轭
+#[inline]
+fn cj(z: (f64, f64)) -> (f64, f64) {
+    (z.0, -z.1)
+}
+
+/// 复 × 实标量
+#[inline]
+fn sc_mul(z: (f64, f64), r: f64) -> (f64, f64) {
+    (z.0 * r, z.1 * r)
+}
+
+/// conj(a) * b
+#[inline]
+fn cj_mul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 * b.0 + a.1 * b.1, a.0 * b.1 - a.1 * b.0)
+}
+
+/// 复 ÷ 实标量
+#[inline]
+fn cdiv_r(z: (f64, f64), r: f64) -> (f64, f64) {
+    (z.0 / r, z.1 / r)
+}
+
+/// 复乘法（运算次序与 Python complex 一致）
+#[inline]
+fn gj_cmul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    (a.0 * b.0 - a.1 * b.1, a.0 * b.1 + a.1 * b.0)
+}
+
+/// 复列内积 Σ conj(w[i,p]) * w[i,q]
+fn jcol_dot_c(work: &[(f64, f64)], mm: usize, nn: usize, p: usize, q: usize) -> (f64, f64) {
+    let mut s = (0.0, 0.0);
+    for i in 0..mm {
+        let t = cj_mul(work[i * nn + p], work[i * nn + q]);
+        s = (s.0 + t.0, s.1 + t.1);
+    }
+    s
+}
+
+/// 单侧 Jacobi SVD 共享实现（仅实数），语义与 Python _svd_jacobi
+/// （实数分支）逐条对齐：m<n 转置为 A^T 分解、末端回映；100 sweeps，
+/// 收敛 off <= 1e-28*sum(d²)+1e-300；ag <= 1e-15*sqrt(alpha*beta) 跳过
+/// 旋转；半角 t/z 公式（[cp,cq] -> [c*cp+s*cq, -s*cp+c*cq]）；sig 降序
+/// 稳定排序（并列/NaN 保持原序）；U 对 sp <= 1e-15*smax 的列留零；
+/// full 且 mm>nn 时 Gram-Schmidt 补基（ne < 1e-8 跳过）。
+/// 返回 (u flat, u shape, sig, vh flat, vh shape)：full → u (m,m)、
+/// vh (n,n)；reduced → u (m,k)、vh (k,n)。
+fn svd_jacobi_impl(
+    data: &[f64],
+    m: usize,
+    n: usize,
+    full_matrices: bool,
+) -> (Vec<f64>, (usize, usize), Vec<f64>, Vec<f64>, (usize, usize)) {
+    let k = m.min(n);
+    let transposed = m < n;
+    let (mm, nn) = if transposed { (n, m) } else { (m, n) };
+    let mut work: Vec<f64> = if transposed {
+        let mut w = vec![0.0; mm * nn];
+        for i in 0..m {
+            for j in 0..n {
+                w[j * nn + i] = data[i * n + j];
+            }
+        }
+        w
+    } else {
+        data.to_vec()
+    };
+    let mut v_acc: Vec<f64> = vec![0.0; nn * nn];
+    for i in 0..nn {
+        v_acc[i * nn + i] = 1.0;
+    }
+    for _sweep in 0..100 {
+        let mut off = 0.0;
+        let diag: Vec<f64> = (0..nn)
+            .map(|p| jcol_dot(&work, mm, nn, p, p).abs())
+            .collect();
+        for p in 0..nn {
+            for q in (p + 1)..nn {
+                let g = jcol_dot(&work, mm, nn, p, q);
+                off += g * g;
+            }
+        }
+        if off <= 1e-28 * diag.iter().map(|d| d * d).sum::<f64>() + 1e-300 {
+            break;
+        }
+        for p in 0..nn {
+            for q in (p + 1)..nn {
+                let alpha = jcol_dot(&work, mm, nn, p, p).abs();
+                let beta = jcol_dot(&work, mm, nn, q, q).abs();
+                let gamma = jcol_dot(&work, mm, nn, p, q);
+                let ag = gamma.abs();
+                if ag <= 1e-15 * (alpha * beta).sqrt() {
+                    continue;
+                }
+                let z = (beta - alpha) / (2.0 * gamma);
+                let t = if z >= 0.0 { -1.0 } else { 1.0 } / (z.abs() + (1.0 + z * z).sqrt());
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let s = t * c;
+                for i in 0..mm {
+                    let wp = work[i * nn + p];
+                    let wq = work[i * nn + q];
+                    work[i * nn + p] = c * wp + s * wq;
+                    work[i * nn + q] = -s * wp + c * wq;
+                }
+                for i in 0..nn {
+                    let vp = v_acc[i * nn + p];
+                    let vq = v_acc[i * nn + q];
+                    v_acc[i * nn + p] = c * vp + s * vq;
+                    v_acc[i * nn + q] = -s * vp + c * vq;
+                }
+            }
+        }
+    }
+    let sig_raw: Vec<f64> = (0..nn)
+        .map(|p| jcol_dot(&work, mm, nn, p, p).abs().sqrt())
+        .collect();
+    let mut order: Vec<usize> = (0..nn).collect();
+    order.sort_by(|&x, &y| {
+        sig_raw[y]
+            .partial_cmp(&sig_raw[x])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let sig: Vec<f64> = order.iter().map(|&p| sig_raw[p]).collect();
+    let smax = sig.first().copied().unwrap_or(0.0);
+    let mut u_part: Vec<f64> = vec![0.0; mm * nn];
+    for (new_p, &old_p) in order.iter().enumerate() {
+        let sp = sig[new_p];
+        if sp > 1e-15 * smax {
+            for i in 0..mm {
+                u_part[i * nn + new_p] = work[i * nn + old_p] / sp;
+            }
+        }
+    }
+    let mut vh_mat: Vec<f64> = vec![0.0; nn * nn];
+    for i in 0..nn {
+        for j in 0..nn {
+            vh_mat[i * nn + j] = v_acc[j * nn + order[i]];
+        }
+    }
+    // u_part 补零至 (mm, mm)，供 full 补基与转置分支索引
+    let mut u_pad: Vec<f64> = vec![0.0; mm * mm];
+    for i in 0..mm {
+        for j in 0..nn {
+            u_pad[i * mm + j] = u_part[i * nn + j];
+        }
+    }
+    if full_matrices && mm > nn {
+        let mut basis: Vec<Vec<f64>> = (0..nn)
+            .map(|p| (0..mm).map(|i| u_pad[i * mm + p]).collect())
+            .collect();
+        for i in 0..mm {
+            let mut e: Vec<f64> = (0..mm).map(|r| if r == i { 1.0 } else { 0.0 }).collect();
+            for b in basis.iter() {
+                let proj: f64 = (0..mm).map(|r| b[r] * e[r]).sum();
+                for r in 0..mm {
+                    e[r] -= proj * b[r];
+                }
+            }
+            let ne = (0..mm).map(|r| e[r] * e[r]).sum::<f64>().sqrt();
+            if ne < 1e-8 {
+                continue;
+            }
+            basis.push(e.iter().map(|&x| x / ne).collect());
+            if basis.len() == mm {
+                break;
+            }
+        }
+        for (col_idx, col) in basis.iter().enumerate().skip(nn) {
+            for i in 0..mm {
+                u_pad[i * mm + col_idx] = col[i];
+            }
+        }
+    }
+    let (u_full, vh_full): (Vec<f64>, Vec<f64>) = if transposed {
+        let mut u_out = vec![0.0; nn * nn];
+        for i in 0..nn {
+            for j in 0..nn {
+                u_out[j * nn + i] = vh_mat[i * nn + j];
+            }
+        }
+        let mut vh_out = vec![0.0; mm * mm];
+        for i in 0..mm {
+            for j in 0..mm {
+                vh_out[i * mm + j] = u_pad[j * mm + i];
+            }
+        }
+        (u_out, vh_out)
+    } else {
+        (u_pad, vh_mat)
+    };
+    let mut u_out = u_full;
+    let mut vh_out = vh_full;
+    let mut u_shape = (m, m);
+    let mut v_shape = (n, n);
+    if !full_matrices {
+        let nu: Vec<f64> = (0..m)
+            .flat_map(|i| u_out[i * m..i * m + k].iter().copied())
+            .collect();
+        let nv = vh_out[..k * n].to_vec();
+        u_shape = (m, k);
+        v_shape = (k, n);
+        u_out = nu;
+        vh_out = nv;
+    }
+    (u_out, u_shape, sig, vh_out, v_shape)
+}
+
+/// 单侧 Jacobi SVD 复数共享实现。语义与 Python _svd_jacobi 复数分支
+/// 逐条对齐：m<n 转置为 A^T（纯转置）分解、末端回映；100 sweeps，收敛
+/// off <= 1e-28*sum(d²)+1e-300（off = Σ|交叉|²，d = |列自内积|）；
+/// ag <= 1e-15*sqrt(alpha*beta) 跳过旋转；先将交叉项相位归一到 |gamma|
+/// （phase = conj(gamma)/|gamma|，work 列 q 与 v_acc 列 q 乘 phase），
+/// 其后半角 t/z 与旋转同实数版（c, s 实数）；sig 降序稳定排序
+/// （并列/NaN 保持原序）；U 对 sp <= 1e-15*smax 的列留零；Vh = V^H
+/// （共轭转置 + 重排）；full 且 mm>nn 时复 Gram-Schmidt 补基
+/// （ne < 1e-8 跳过）；转置分支 u_out = Vh^T、vh_out = U^T（纯转置）；
+/// 非有限复数边缘 |phase|<=0（Python 会在 `z >= 0` 抛 TypeError）→
+/// 返回 Err，由 Python 兜底复现同一异常。
+/// 返回 (u re, u im, u shape, sig, vh re, vh im, vh shape)。
+fn svd_jacobi_impl_c(
+    re: &[f64],
+    im: &[f64],
+    m: usize,
+    n: usize,
+    full_matrices: bool,
+) -> PyResult<(
+    Vec<f64>,
+    Vec<f64>,
+    (usize, usize),
+    Vec<f64>,
+    Vec<f64>,
+    Vec<f64>,
+    (usize, usize),
+)> {
+    let k = m.min(n);
+    let transposed = m < n;
+    let (mm, nn) = if transposed { (n, m) } else { (m, n) };
+    let mut work: Vec<(f64, f64)> = if transposed {
+        let mut w = vec![(0.0, 0.0); mm * nn];
+        for i in 0..m {
+            for j in 0..n {
+                w[j * nn + i] = (re[i * n + j], im[i * n + j]);
+            }
+        }
+        w
+    } else {
+        re.iter().zip(im.iter()).map(|(&r, &i)| (r, i)).collect()
+    };
+    let mut v_acc: Vec<(f64, f64)> = vec![(0.0, 0.0); nn * nn];
+    for i in 0..nn {
+        v_acc[i * nn + i] = (1.0, 0.0);
+    }
+    for _sweep in 0..100 {
+        let mut off = 0.0;
+        let diag: Vec<f64> = (0..nn)
+            .map(|p| gj_mag(jcol_dot_c(&work, mm, nn, p, p)))
+            .collect();
+        for p in 0..nn {
+            for q in (p + 1)..nn {
+                let g = gj_mag(jcol_dot_c(&work, mm, nn, p, q));
+                off += g * g;
+            }
+        }
+        if off <= 1e-28 * diag.iter().map(|d| d * d).sum::<f64>() + 1e-300 {
+            break;
+        }
+        for p in 0..nn {
+            for q in (p + 1)..nn {
+                let alpha = gj_mag(jcol_dot_c(&work, mm, nn, p, p));
+                let beta = gj_mag(jcol_dot_c(&work, mm, nn, q, q));
+                let gamma = jcol_dot_c(&work, mm, nn, p, q);
+                let ag = gj_mag(gamma);
+                if ag <= 1e-15 * (alpha * beta).sqrt() {
+                    continue;
+                }
+                let phase = cdiv_r(cj(gamma), ag);
+                if ag <= 0.0 || gj_mag(phase) <= 0.0 {
+                    // 非有限边缘：Python 对复数 `z >= 0` 抛 TypeError，
+                    // 这里统一 Err，Python 兜底复现同一异常
+                    return Err(PyValueError::new_err(
+                        "svd_jacobi: non-finite complex entry",
+                    ));
+                }
+                for i in 0..mm {
+                    work[i * nn + q] = gj_cmul(work[i * nn + q], phase);
+                }
+                for i in 0..nn {
+                    v_acc[i * nn + q] = gj_cmul(v_acc[i * nn + q], phase);
+                }
+                let z = (beta - alpha) / (2.0 * ag);
+                let t = if z >= 0.0 { -1.0 } else { 1.0 } / (z.abs() + (1.0 + z * z).sqrt());
+                let c = 1.0 / (1.0 + t * t).sqrt();
+                let s = t * c;
+                for i in 0..mm {
+                    let wp = work[i * nn + p];
+                    let wq = work[i * nn + q];
+                    let cwp = sc_mul(wp, c);
+                    let cwq = sc_mul(wq, c);
+                    let swp = sc_mul(wp, s);
+                    let swq = sc_mul(wq, s);
+                    work[i * nn + p] = (cwp.0 + swq.0, cwp.1 + swq.1);
+                    work[i * nn + q] = (cwq.0 - swp.0, cwq.1 - swp.1);
+                }
+                for i in 0..nn {
+                    let vp = v_acc[i * nn + p];
+                    let vq = v_acc[i * nn + q];
+                    let cvp = sc_mul(vp, c);
+                    let cvq = sc_mul(vq, c);
+                    let svp = sc_mul(vp, s);
+                    let svq = sc_mul(vq, s);
+                    v_acc[i * nn + p] = (cvp.0 + svq.0, cvp.1 + svq.1);
+                    v_acc[i * nn + q] = (cvq.0 - svp.0, cvq.1 - svp.1);
+                }
+            }
+        }
+    }
+    let sig_raw: Vec<f64> = (0..nn)
+        .map(|p| gj_mag(jcol_dot_c(&work, mm, nn, p, p)).sqrt())
+        .collect();
+    let mut order: Vec<usize> = (0..nn).collect();
+    order.sort_by(|&x, &y| {
+        sig_raw[y]
+            .partial_cmp(&sig_raw[x])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let sig: Vec<f64> = order.iter().map(|&p| sig_raw[p]).collect();
+    let smax = sig.first().copied().unwrap_or(0.0);
+    let mut u_part: Vec<(f64, f64)> = vec![(0.0, 0.0); mm * nn];
+    for (new_p, &old_p) in order.iter().enumerate() {
+        let sp = sig[new_p];
+        if sp > 1e-15 * smax {
+            for i in 0..mm {
+                u_part[i * nn + new_p] = cdiv_r(work[i * nn + old_p], sp);
+            }
+        }
+    }
+    // Vh = V^H：Vh[i][j] = conj(v_acc[j][order[i]])
+    let mut vh_mat: Vec<(f64, f64)> = vec![(0.0, 0.0); nn * nn];
+    for i in 0..nn {
+        for j in 0..nn {
+            vh_mat[i * nn + j] = cj(v_acc[j * nn + order[i]]);
+        }
+    }
+    // u_part 补零至 (mm, mm)
+    let mut u_pad: Vec<(f64, f64)> = vec![(0.0, 0.0); mm * mm];
+    for i in 0..mm {
+        for j in 0..nn {
+            u_pad[i * mm + j] = u_part[i * nn + j];
+        }
+    }
+    if full_matrices && mm > nn {
+        // 复 Gram-Schmidt：proj = Σ conj(b[r]) e[r]，e -= proj * b
+        let mut basis: Vec<Vec<(f64, f64)>> = (0..nn)
+            .map(|p| (0..mm).map(|i| u_pad[i * mm + p]).collect())
+            .collect();
+        for i in 0..mm {
+            let mut e: Vec<(f64, f64)> = (0..mm)
+                .map(|r| if r == i { (1.0, 0.0) } else { (0.0, 0.0) })
+                .collect();
+            for b in basis.iter() {
+                let mut proj = (0.0, 0.0);
+                for r in 0..mm {
+                    let t = cj_mul(b[r], e[r]);
+                    proj = (proj.0 + t.0, proj.1 + t.1);
+                }
+                for r in 0..mm {
+                    let t = gj_cmul(proj, b[r]);
+                    e[r] = (e[r].0 - t.0, e[r].1 - t.1);
+                }
+            }
+            let ne = (0..mm).map(|r| gj_mag(e[r]).powi(2)).sum::<f64>().sqrt();
+            if ne < 1e-8 {
+                continue;
+            }
+            basis.push(e.iter().map(|&z| cdiv_r(z, ne)).collect());
+            if basis.len() == mm {
+                break;
+            }
+        }
+        for (col_idx, col) in basis.iter().enumerate().skip(nn) {
+            for i in 0..mm {
+                u_pad[i * mm + col_idx] = col[i];
+            }
+        }
+    }
+    let (u_full, vh_full): (Vec<(f64, f64)>, Vec<(f64, f64)>) = if transposed {
+        let mut u_out = vec![(0.0, 0.0); nn * nn];
+        for i in 0..nn {
+            for j in 0..nn {
+                u_out[j * nn + i] = vh_mat[i * nn + j];
+            }
+        }
+        let mut vh_out = vec![(0.0, 0.0); mm * mm];
+        for i in 0..mm {
+            for j in 0..mm {
+                vh_out[i * mm + j] = u_pad[j * mm + i];
+            }
+        }
+        (u_out, vh_out)
+    } else {
+        (u_pad, vh_mat)
+    };
+    let mut u_out = u_full;
+    let mut vh_out = vh_full;
+    let mut u_shape = (m, m);
+    let mut v_shape = (n, n);
+    if !full_matrices {
+        let nu: Vec<(f64, f64)> = (0..m)
+            .flat_map(|i| u_out[i * m..i * m + k].iter().copied())
+            .collect();
+        let nv = vh_out[..k * n].to_vec();
+        u_shape = (m, k);
+        v_shape = (k, n);
+        u_out = nu;
+        vh_out = nv;
+    }
+    Ok((
+        u_out.iter().map(|z| z.0).collect(),
+        u_out.iter().map(|z| z.1).collect(),
+        u_shape,
+        sig,
+        vh_out.iter().map(|z| z.0).collect(),
+        vh_out.iter().map(|z| z.1).collect(),
+        v_shape,
+    ))
+}
+
+/// SVD 输入校验：2-d 非空矩阵（实数/复数）；空 → Err（Python 侧回退
+/// 纯 Python Jacobi）。返回 (m, n, flat real, flat imag — 实数为 None)。
+fn svd_jacobi_check(a: &NdArray) -> PyResult<(usize, usize, Vec<f64>, Option<Vec<f64>>)> {
+    let shape: Vec<usize> = a.data.shape().to_vec();
+    if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
+        return Err(PyValueError::new_err(
+            "svd_jacobi: a must be non-empty (m, n)",
+        ));
+    }
+    let data: Vec<f64> = a.data.iter().copied().collect();
+    let imag = a.imag.as_ref().map(|arr| arr.iter().copied().collect());
+    Ok((shape[0], shape[1], data, imag))
+}
+
+/// SVD 奇异值（任意 m×n，实数/复数）：1-d 降序 sig（len = min(m,n)）。
+/// 空矩阵返回 Err，由 Python 侧回退纯 Python Jacobi；非有限复数边缘
+/// 亦 Err（Python 同样情形抛 TypeError）。
+#[pyfunction]
+fn svd_jacobi_sig(a: &NdArray) -> PyResult<NdArray> {
+    let (m, n, data, imag) = svd_jacobi_check(a)?;
+    let sig = match imag {
+        None => svd_jacobi_impl(&data, m, n, false).2,
+        Some(im) => svd_jacobi_impl_c(&data, &im, m, n, false)?.3,
+    };
+    let arr = Array::from_shape_vec(IxDyn(&[sig.len()]), sig)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        data: arr,
+        imag: None,
+    })
+}
+
+/// 完整 SVD（任意 m×n，实数/复数）：(u, s, vh)——full：u (m,m)、vh
+/// (n,n)；reduced：u (m,k)、vh (k,n)，s 降序 (k,)。语义与 Python
+/// _svd_jacobi 实数/复数分支一致；空矩阵返回 Err。
+#[pyfunction]
+fn svd_jacobi_uv(a: &NdArray, full_matrices: bool) -> PyResult<(NdArray, NdArray, NdArray)> {
+    let (m, n, data, imag) = svd_jacobi_check(a)?;
+    match imag {
+        None => {
+            let (u, us, sig, vh, vs) = svd_jacobi_impl(&data, m, n, full_matrices);
+            let u_arr = Array::from_shape_vec(IxDyn(&[us.0, us.1]), u)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let s_arr = Array::from_shape_vec(IxDyn(&[sig.len()]), sig)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let vh_arr = Array::from_shape_vec(IxDyn(&[vs.0, vs.1]), vh)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Ok((
+                NdArray {
+                    data: u_arr,
+                    imag: None,
+                },
+                NdArray {
+                    data: s_arr,
+                    imag: None,
+                },
+                NdArray {
+                    data: vh_arr,
+                    imag: None,
+                },
+            ))
+        }
+        Some(im) => {
+            let (u_re, u_im, us, sig, vh_re, vh_im, vs) =
+                svd_jacobi_impl_c(&data, &im, m, n, full_matrices)?;
+            let u_arr = Array::from_shape_vec(IxDyn(&[us.0, us.1]), u_re)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let u_imag = Array::from_shape_vec(IxDyn(&[us.0, us.1]), u_im)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let s_arr = Array::from_shape_vec(IxDyn(&[sig.len()]), sig)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let vh_arr = Array::from_shape_vec(IxDyn(&[vs.0, vs.1]), vh_re)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let vh_imag = Array::from_shape_vec(IxDyn(&[vs.0, vs.1]), vh_im)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            Ok((
+                NdArray {
+                    data: u_arr,
+                    imag: Some(u_imag),
+                },
+                NdArray {
+                    data: s_arr,
+                    imag: None,
+                },
+                NdArray {
+                    data: vh_arr,
+                    imag: Some(vh_imag),
+                },
+            ))
+        }
+    }
+}
+
+/// SVD 后组装核心（pinv / lstsq），内部复用已验证的 Jacobi SVD
+/// （实/复）；语义与 pinv._one / lstsq 的纯 Python 组装逐条对齐：
+/// cutoff = rcond * s_max（s_max = max(s)），rank = count(s > cutoff)；
+/// pinv 模式（b=None）：P[i][r] = Σ_j conj(vt[j][i])·s_inv[j]·
+/// conj(u[r][j])，s_inv==0 时跳过；
+/// lstsq 模式（b: (m,) / (m,r)）：uhb[j] = Σ_i conj(u[i][j])·b[i][c]，
+/// x[i][c] = Σ_j conj(vt[j][i])·s_inv[j]·uhb[j]；residuals =
+/// 逐列 Σ_i |b - A x|²，仅 m>n 且 rank==n 且 r>0 时非空。
+/// 返回 (P 或 x, residuals（pinv 模式为空）, rank, s)。
+#[pyfunction]
+#[pyo3(signature = (a, b=None, rcond=1e-15, mode=0))]
+fn svd_assemble_core(
+    a: &NdArray,
+    b: Option<&NdArray>,
+    rcond: f64,
+    mode: u8,
+) -> PyResult<(NdArray, NdArray, i64, NdArray)> {
+    fn build_2d(re: Vec<f64>, im: Option<Vec<f64>>, rows: usize, cols: usize) -> PyResult<NdArray> {
+        let data = Array::from_shape_vec(IxDyn(&[rows, cols]), re)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let imag = match im {
+            Some(v) => Some(
+                Array::from_shape_vec(IxDyn(&[rows, cols]), v)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?,
+            ),
+            None => None,
+        };
+        Ok(NdArray { data, imag })
+    }
+    let (m, n, data, imag) = svd_jacobi_check(a)?;
+    let (u, s, vh) = match &imag {
+        None => {
+            let (u, _us, s, vh, _vs) = svd_jacobi_impl(&data, m, n, false);
+            (
+                u.iter().map(|&r| (r, 0.0)).collect::<Vec<_>>(),
+                s,
+                vh.iter().map(|&r| (r, 0.0)).collect::<Vec<_>>(),
+            )
+        }
+        Some(im) => {
+            let (u_re, u_im, _us, s, vh_re, vh_im, _vs) =
+                svd_jacobi_impl_c(&data, im, m, n, false)?;
+            (
+                u_re.iter()
+                    .zip(u_im.iter())
+                    .map(|(&r, &i)| (r, i))
+                    .collect(),
+                s,
+                vh_re
+                    .iter()
+                    .zip(vh_im.iter())
+                    .map(|(&r, &i)| (r, i))
+                    .collect(),
+            )
+        }
+    };
+    let is_c = a.imag.is_some();
+    let k = m.min(n);
+    let s_max = s.iter().cloned().fold(0.0f64, f64::max);
+    let cutoff = rcond * s_max;
+    let rank = s.iter().filter(|v| **v > cutoff).count() as i64;
+    let s_inv: Vec<f64> = s
+        .iter()
+        .map(|v| if *v > cutoff { 1.0 / v } else { 0.0 })
+        .collect();
+    let s_arr = Array::from_shape_vec(IxDyn(&[s.len()]), s.clone())
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let s_out = NdArray {
+        data: s_arr,
+        imag: None,
+    };
+    if mode == 0 {
+        // pinv：P = V·D⁺·U^H（s_inv 为 0 的三元组跳过，语义同 pinv._one）
+        if b.is_some() {
+            return Err(PyValueError::new_err(
+                "svd_assemble_core: pinv mode takes no b",
+            ));
+        }
+        let mut p_re = vec![0.0; n * m];
+        let mut p_im = vec![0.0; n * m];
+        for j in 0..k {
+            let si = s_inv[j];
+            if si == 0.0 {
+                continue;
+            }
+            for i in 0..n {
+                let a1 = sc_mul(cj(vh[j * n + i]), si);
+                if a1 == (0.0, 0.0) {
+                    continue;
+                }
+                for r in 0..m {
+                    let t = gj_cmul(a1, cj(u[r * k + j]));
+                    p_re[i * m + r] += t.0;
+                    p_im[i * m + r] += t.1;
+                }
+            }
+        }
+        let p = build_2d(p_re, if is_c { Some(p_im) } else { None }, n, m)?;
+        let res_arr = Array::from_shape_vec(IxDyn(&[0]), vec![])
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        return Ok((
+            p,
+            NdArray {
+                data: res_arr,
+                imag: None,
+            },
+            rank,
+            s_out,
+        ));
+    }
+    // lstsq：b 校验 (m,) 或 (m, r)
+    let b_arr = match b {
+        Some(x) => x,
+        None => {
+            return Err(PyValueError::new_err(
+                "svd_assemble_core: lstsq mode requires b",
+            ));
+        }
+    };
+    let bs: Vec<usize> = b_arr.data.shape().to_vec();
+    let n_rhs = match bs.as_slice() {
+        [mm] if *mm == m => 1,
+        [mm, rr] if *mm == m => *rr,
+        _ => {
+            return Err(PyValueError::new_err(
+                "svd_assemble_core: b must be (m,) or (m, r)",
+            ));
+        }
+    };
+    let is_bc = b_arr.imag.is_some();
+    let bre: Vec<f64> = b_arr.data.iter().copied().collect();
+    let bim: Vec<f64> = b_arr
+        .imag
+        .as_ref()
+        .map(|x| x.iter().copied().collect())
+        .unwrap_or_default();
+    let bvec: Vec<(f64, f64)> = if is_bc {
+        bre.iter().zip(bim.iter()).map(|(&r, &i)| (r, i)).collect()
+    } else {
+        bre.iter().map(|&r| (r, 0.0)).collect()
+    };
+    let aim: Vec<f64> = match &imag {
+        Some(v) => v.clone(),
+        None => vec![0.0; m * n],
+    };
+    // x = Vh^H · diag(1/s) · U^H · b（运算次序与 Python 逐条对齐）
+    let mut x_re = vec![0.0; n * n_rhs];
+    let mut x_im = vec![0.0; n * n_rhs];
+    for c in 0..n_rhs {
+        let mut uhb: Vec<(f64, f64)> = vec![(0.0, 0.0); k];
+        for j in 0..k {
+            for i in 0..m {
+                let t = cj_mul(u[i * k + j], bvec[i * n_rhs + c]);
+                uhb[j] = (uhb[j].0 + t.0, uhb[j].1 + t.1);
+            }
+        }
+        for i in 0..n {
+            let mut acc = (0.0, 0.0);
+            for j in 0..k {
+                let t = gj_cmul(sc_mul(cj(vh[j * n + i]), s_inv[j]), uhb[j]);
+                acc = (acc.0 + t.0, acc.1 + t.1);
+            }
+            x_re[i * n_rhs + c] = acc.0;
+            x_im[i * n_rhs + c] = acc.1;
+        }
+    }
+    // 残差：m>n 且满列秩时逐列 Σ |b - A x|²（与 Python 同次序）
+    let compute_res = m > n && rank == n as i64 && n_rhs > 0;
+    let mut res_vals: Vec<f64> = vec![];
+    if compute_res {
+        for c in 0..n_rhs {
+            let mut acc = 0.0f64;
+            for i in 0..m {
+                let mut r = bvec[i * n_rhs + c];
+                for kk in 0..n {
+                    let t = gj_cmul(
+                        (data[i * n + kk], aim[i * n + kk]),
+                        (x_re[kk * n_rhs + c], x_im[kk * n_rhs + c]),
+                    );
+                    r = (r.0 - t.0, r.1 - t.1);
+                }
+                acc += gj_mag(r).powi(2);
+            }
+            res_vals.push(acc);
+        }
+    }
+    let x = build_2d(
+        x_re,
+        if is_c || is_bc { Some(x_im) } else { None },
+        n,
+        n_rhs,
+    )?;
+    let res_arr = Array::from_shape_vec(IxDyn(&[res_vals.len()]), res_vals)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((
+        x,
+        NdArray {
+            data: res_arr,
+            imag: None,
+        },
+        rank,
+        s_out,
+    ))
+}
+
+/// Householder QR 核心（任意 m×n，实/复），语义与 Python
+/// _qr_householder 逐条对齐：alpha 相位约定（复数 alpha =
+/// -x0/|x0|·||x||（|x0|=0 → -||x||），实数 -sign(x0)·||x||，均取
+/// 首分量相加避相消）；v = x - alpha·e1，H = I - 2vv^H/v^Hv；
+/// R 就地上三角，Q 同步累积（Q_new = Q_old @ H，复数时 factor
+/// 取共轭后乘 conj(v)）；norm==0 或 vv==0 跳过该列；反射残留的
+/// 下三角显式置零。want_complete：Q (m,m)、R (m,n)；否则
+/// Q (m,k)、R (k,n)，k=min(m,n)。空矩阵 → Err（Python 兜底）。
+#[pyfunction]
+#[pyo3(signature = (a, want_complete))]
+fn qr_householder_core(a: &NdArray, want_complete: bool) -> PyResult<(NdArray, NdArray)> {
+    let shape: Vec<usize> = a.data.shape().to_vec();
+    if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
+        return Err(PyValueError::new_err(
+            "qr_householder: cannot factor an empty matrix",
+        ));
+    }
+    let m = shape[0];
+    let n = shape[1];
+    let k = m.min(n);
+    let is_c = a.imag.is_some();
+    let mut work: Vec<(f64, f64)> = match &a.imag {
+        None => a.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => a
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    let mut q: Vec<(f64, f64)> = vec![(0.0, 0.0); m * m];
+    for i in 0..m {
+        q[i * m + i] = (1.0, 0.0);
+    }
+    for j in 0..k {
+        let width = m - j;
+        let mut norm2 = 0.0f64;
+        for i in 0..width {
+            norm2 += gj_mag(work[(j + i) * n + j]).powi(2);
+        }
+        let norm = norm2.sqrt();
+        if norm == 0.0 {
+            continue;
+        }
+        let lead = work[j * n + j];
+        let alpha: (f64, f64) = if is_c {
+            let mag = gj_mag(lead);
+            if mag > 0.0 {
+                // 注意 -lead 是取负 (-lr, -li)，不是共轭
+                sc_mul(cdiv_r((-lead.0, -lead.1), mag), norm)
+            } else {
+                (-norm, 0.0)
+            }
+        } else {
+            ((if lead.0 < 0.0 { -norm } else { norm }), 0.0)
+        };
+        let mut v: Vec<(f64, f64)> = (0..width).map(|i| work[(j + i) * n + j]).collect();
+        v[0] = (v[0].0 - alpha.0, v[0].1 - alpha.1);
+        let mut vv = 0.0f64;
+        for t in v.iter() {
+            vv += gj_mag(*t).powi(2);
+        }
+        if vv == 0.0 {
+            continue;
+        }
+        // R 更新（列 c = j..n）：rows -= (2·dot2(v, col)/vv)·v
+        for c in j..n {
+            let mut d = (0.0, 0.0);
+            for i in 0..width {
+                let t = cj_mul(v[i], work[(j + i) * n + c]);
+                d = (d.0 + t.0, d.1 + t.1);
+            }
+            let f = (2.0 * d.0 / vv, 2.0 * d.1 / vv);
+            for i in 0..width {
+                let w = work[(j + i) * n + c];
+                let t = gj_cmul(f, v[i]);
+                work[(j + i) * n + c] = (w.0 - t.0, w.1 - t.1);
+            }
+        }
+        // Q 更新（行 r）：Q_seg -= conj(2·dot2(Q_seg, conj(v))/vv)·conj(v)
+        for r_row in 0..m {
+            let mut d = (0.0, 0.0);
+            for i in 0..width {
+                let t = cj_mul(q[r_row * m + j + i], cj(v[i]));
+                d = (d.0 + t.0, d.1 + t.1);
+            }
+            let mut f = (2.0 * d.0 / vv, 2.0 * d.1 / vv);
+            if is_c {
+                f = cj(f);
+            }
+            for i in 0..width {
+                let w = q[r_row * m + j + i];
+                let t = gj_cmul(f, cj(v[i]));
+                q[r_row * m + j + i] = (w.0 - t.0, w.1 - t.1);
+            }
+        }
+    }
+    // 反射残留的下三角显式置零（j < min(i, n)）
+    for i in 0..m {
+        for j in 0..i.min(n) {
+            work[i * n + j] = (0.0, 0.0);
+        }
+    }
+    let q_re: Vec<f64> = q.iter().map(|z| z.0).collect();
+    let q_im: Vec<f64> = q.iter().map(|z| z.1).collect();
+    let r_re: Vec<f64> = work.iter().map(|z| z.0).collect();
+    let r_im: Vec<f64> = work.iter().map(|z| z.1).collect();
+    let (q_re, q_im, q_shape) = if want_complete {
+        (q_re, q_im, (m, m))
+    } else {
+        let nu: Vec<f64> = (0..m)
+            .flat_map(|i| q_re[i * m..i * m + k].iter().copied())
+            .collect();
+        let ni: Vec<f64> = (0..m)
+            .flat_map(|i| q_im[i * m..i * m + k].iter().copied())
+            .collect();
+        (nu, ni, (m, k))
+    };
+    let (r_re, r_im, r_shape) = if want_complete {
+        (r_re, r_im, (m, n))
+    } else {
+        (r_re[..k * n].to_vec(), r_im[..k * n].to_vec(), (k, n))
+    };
+    let q_arr = Array::from_shape_vec(IxDyn(&[q_shape.0, q_shape.1]), q_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let r_arr = Array::from_shape_vec(IxDyn(&[r_shape.0, r_shape.1]), r_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let q_imag = if is_c {
+        Some(
+            Array::from_shape_vec(IxDyn(&[q_shape.0, q_shape.1]), q_im)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let r_imag = if is_c {
+        Some(
+            Array::from_shape_vec(IxDyn(&[r_shape.0, r_shape.1]), r_im)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        )
+    } else {
+        None
+    };
+    Ok((
+        NdArray {
+            data: q_arr,
+            imag: q_imag,
+        },
+        NdArray {
+            data: r_arr,
+            imag: r_imag,
+        },
+    ))
+}
+
+/// 复平方根主支（cmath.sqrt 语义）
+#[inline]
+fn csqrt(z: (f64, f64)) -> (f64, f64) {
+    let (r, i) = z;
+    if r == 0.0 && i == 0.0 {
+        return (0.0, 0.0);
+    }
+    let m = gj_mag(z);
+    let re = ((m + r) / 2.0).sqrt();
+    let im = if i >= 0.0 {
+        ((m - r) / 2.0).sqrt()
+    } else {
+        -((m - r) / 2.0).sqrt()
+    };
+    (re, im)
+}
+
+/// 2x2 块特征值（降序），语义同 Python _2x2
+fn eig2(work: &[(f64, f64)], n: usize, lo: usize) -> ((f64, f64), (f64, f64)) {
+    let a = work[lo * n + lo];
+    let b = work[lo * n + lo + 1];
+    let c = work[(lo + 1) * n + lo];
+    let d = work[(lo + 1) * n + lo + 1];
+    let tr = (a.0 + d.0, a.1 + d.1);
+    // det = a*d - b*c（复数）
+    let det = (
+        a.0 * d.0 - a.1 * d.1 - (b.0 * c.0 - b.1 * c.1),
+        a.0 * d.1 + a.1 * d.0 - (b.0 * c.1 + b.1 * c.0),
+    );
+    // disc = sqrt(tr² - 4det)
+    let disc = csqrt((
+        tr.0 * tr.0 - tr.1 * tr.1 - 4.0 * det.0,
+        2.0 * tr.0 * tr.1 - 4.0 * det.1,
+    ));
+    let e1 = ((tr.0 + disc.0) / 2.0, (tr.1 + disc.1) / 2.0);
+    let e2 = ((tr.0 - disc.0) / 2.0, (tr.1 - disc.1) / 2.0);
+    (e1, e2)
+}
+
+/// Hessenberg 相似约化（复 Householder），语义与 Python
+/// _hessenberg_reduce 逐条对齐
+fn hessenberg_reduce(work: &mut [(f64, f64)], n: usize) {
+    if n <= 2 {
+        return;
+    }
+    for j in 0..(n - 2) {
+        let lo = j + 1;
+        let mut norm2 = 0.0f64;
+        for t in lo..n {
+            norm2 += gj_mag(work[t * n + j]).powi(2);
+        }
+        let norm_x = norm2.sqrt();
+        if norm_x == 0.0 {
+            continue;
+        }
+        let x0 = work[lo * n + j];
+        let sgn: (f64, f64) = if gj_mag(x0) > 0.0 {
+            cdiv_r(x0, gj_mag(x0))
+        } else {
+            (1.0, 0.0)
+        };
+        let mut v: Vec<(f64, f64)> = (lo..n).map(|t| work[t * n + j]).collect();
+        v[0] = (v[0].0 + sgn.0 * norm_x, v[0].1 + sgn.1 * norm_x);
+        let mut nv2 = 0.0f64;
+        for t in v.iter() {
+            nv2 += gj_mag(*t).powi(2);
+        }
+        let nv = nv2.sqrt();
+        if nv == 0.0 {
+            continue;
+        }
+        for t in v.iter_mut() {
+            *t = cdiv_r(*t, nv);
+        }
+        // w = v^H A[:, j..]（先从未修改的 A 完整算出）
+        for c in j..n {
+            let mut w = (0.0, 0.0);
+            for t in lo..n {
+                let p = cj_mul(v[t - lo], work[t * n + c]);
+                w = (w.0 + p.0, w.1 + p.1);
+            }
+            for r in lo..n {
+                let t = sc_mul(v[r - lo], 2.0);
+                let wv = work[r * n + c];
+                let t2 = gj_cmul(t, w);
+                work[r * n + c] = (wv.0 - t2.0, wv.1 - t2.1);
+            }
+        }
+        // 右乘 P：(AP)[r][c] = A[r][c] - 2(Av)[r]·conj(v[c])
+        let mut avs = vec![(0.0, 0.0); n];
+        for r in 0..n {
+            let mut acc = (0.0, 0.0);
+            for t in lo..n {
+                let p = gj_cmul(work[r * n + t], v[t - lo]);
+                acc = (acc.0 + p.0, acc.1 + p.1);
+            }
+            avs[r] = acc;
+        }
+        for c in lo..n {
+            let vc = cj(v[c - lo]);
+            for r in 0..n {
+                let t = sc_mul(avs[r], 2.0);
+                let t2 = gj_cmul(t, vc);
+                let wv = work[r * n + c];
+                work[r * n + c] = (wv.0 - t2.0, wv.1 - t2.1);
+            }
+        }
+    }
+}
+
+/// H[i:m, i:m] - qI 的 Householder QR，返回 (Q, R)（语义同 _qr_factor）
+fn qr_factor(
+    work: &[(f64, f64)],
+    n: usize,
+    i: usize,
+    m: usize,
+    q_shift: (f64, f64),
+) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+    let k = m - i;
+    let mut r = vec![(0.0, 0.0); k * k];
+    for r_ in 0..k {
+        for c in 0..k {
+            let mut v = work[(i + r_) * n + i + c];
+            if r_ == c {
+                v = (v.0 - q_shift.0, v.1 - q_shift.1);
+            }
+            r[r_ * k + c] = v;
+        }
+    }
+    let mut qq: Vec<(f64, f64)> = vec![(0.0, 0.0); k * k];
+    for c in 0..k {
+        qq[c * k + c] = (1.0, 0.0);
+    }
+    if k == 0 {
+        return (qq, r);
+    }
+    for j in 0..k.saturating_sub(1) {
+        let mut norm2 = 0.0f64;
+        for t in j..k {
+            norm2 += gj_mag(r[t * k + j]).powi(2);
+        }
+        let norm_x = norm2.sqrt();
+        if norm_x == 0.0 {
+            continue;
+        }
+        let x0 = r[j * k + j];
+        let sgn: (f64, f64) = if gj_mag(x0) > 0.0 {
+            cdiv_r(x0, gj_mag(x0))
+        } else {
+            (1.0, 0.0)
+        };
+        let mut v: Vec<(f64, f64)> = (j..k).map(|t| r[t * k + j]).collect();
+        v[0] = (v[0].0 + sgn.0 * norm_x, v[0].1 + sgn.1 * norm_x);
+        let mut nv2 = 0.0f64;
+        for t in v.iter() {
+            nv2 += gj_mag(*t).powi(2);
+        }
+        let nv = nv2.sqrt();
+        if nv == 0.0 {
+            continue;
+        }
+        for t in v.iter_mut() {
+            *t = cdiv_r(*t, nv);
+        }
+        // R <- P R
+        for c in j..k {
+            let mut w = (0.0, 0.0);
+            for t in j..k {
+                let p = cj_mul(v[t - j], r[t * k + c]);
+                w = (w.0 + p.0, w.1 + p.1);
+            }
+            for r_ in j..k {
+                let t = sc_mul(v[r_ - j], 2.0);
+                let t2 = gj_cmul(t, w);
+                let wv = r[r_ * k + c];
+                r[r_ * k + c] = (wv.0 - t2.0, wv.1 - t2.1);
+            }
+        }
+        // Q <- Q P
+        for r_ in 0..k {
+            let mut qv = (0.0, 0.0);
+            for t in j..k {
+                let p = gj_cmul(qq[r_ * k + t], v[t - j]);
+                qv = (qv.0 + p.0, qv.1 + p.1);
+            }
+            if qv == (0.0, 0.0) {
+                continue;
+            }
+            for c in j..k {
+                let t = sc_mul(qv, 2.0);
+                let t2 = gj_cmul(t, cj(v[c - j]));
+                let wv = qq[r_ * k + c];
+                qq[r_ * k + c] = (wv.0 - t2.0, wv.1 - t2.1);
+            }
+        }
+    }
+    (qq, r)
+}
+
+/// 单位移 QR 步：B = block - qI = QR → block = RQ + qI（原地回写）
+fn qr_shift_step(work: &mut [(f64, f64)], n: usize, i: usize, m: usize, q_shift: (f64, f64)) {
+    let k = m - i;
+    let (qq, r) = qr_factor(work, n, i, m, q_shift);
+    for r_ in 0..k {
+        for c in 0..k {
+            let mut acc = (0.0, 0.0);
+            for t in 0..k {
+                let p = gj_cmul(r[r_ * k + t], qq[t * k + c]);
+                acc = (acc.0 + p.0, acc.1 + p.1);
+            }
+            let v = if r_ == c {
+                (acc.0 + q_shift.0, acc.1 + q_shift.1)
+            } else {
+                acc
+            };
+            work[(i + r_) * n + i + c] = v;
+        }
+    }
+}
+
+/// Francis 显式双移位步：移位取尾部 2x2 块的两个特征值
+fn qr_double_step(work: &mut [(f64, f64)], n: usize, i: usize, m: usize) {
+    let (a, b, c, d) = (
+        work[(m - 2) * n + m - 2],
+        work[(m - 2) * n + m - 1],
+        work[(m - 1) * n + m - 2],
+        work[(m - 1) * n + m - 1],
+    );
+    let tr = (a.0 + d.0, a.1 + d.1);
+    let det = (
+        a.0 * d.0 - a.1 * d.1 - (b.0 * c.0 - b.1 * c.1),
+        a.0 * d.1 + a.1 * d.0 - (b.0 * c.1 + b.1 * c.0),
+    );
+    let disc = csqrt((
+        tr.0 * tr.0 - tr.1 * tr.1 - 4.0 * det.0,
+        2.0 * tr.0 * tr.1 - 4.0 * det.1,
+    ));
+    qr_shift_step(
+        work,
+        n,
+        i,
+        m,
+        ((tr.0 + disc.0) / 2.0, (tr.1 + disc.1) / 2.0),
+    );
+    qr_shift_step(
+        work,
+        n,
+        i,
+        m,
+        ((tr.0 - disc.0) / 2.0, (tr.1 - disc.1) / 2.0),
+    );
+}
+
+/// dlahqr 式窗口递归驱动（语义同 _qr_iter_eigvals 的 _window）
+fn qr_window(
+    work: &mut [(f64, f64)],
+    n: usize,
+    lo0: usize,
+    mut hi: usize,
+    evals: &mut Vec<(f64, f64)>,
+    it: &mut usize,
+) -> PyResult<()> {
+    let eps = 2.220446049250313e-16;
+    let lo = lo0;
+    let mut stall = 0usize;
+    while hi + 1 > lo {
+        let size = hi - lo + 1;
+        if size == 1 {
+            evals.push(work[lo * n + lo]);
+            return Ok(());
+        }
+        if size == 2 {
+            let (e1, e2) = eig2(work, n, lo);
+            evals.push(e1);
+            evals.push(e2);
+            return Ok(());
+        }
+        // 从底部向上找第一个可收缩次对角元
+        let mut split: Option<usize> = None;
+        for jj in (lo..hi).rev() {
+            let sub = work[(jj + 1) * n + jj];
+            if sub == (0.0, 0.0) {
+                split = Some(jj);
+                break;
+            }
+            if gj_mag(sub)
+                <= eps * (gj_mag(work[jj * n + jj]) + gj_mag(work[(jj + 1) * n + jj + 1]))
+            {
+                work[(jj + 1) * n + jj] = (0.0, 0.0);
+                split = Some(jj);
+                break;
+            }
+        }
+        if let Some(sp) = split {
+            stall = 0;
+            let tsize = hi - sp;
+            if tsize == 1 {
+                evals.push(work[hi * n + hi]);
+                hi = sp;
+                continue;
+            }
+            if tsize == 2 {
+                let (e1, e2) = eig2(work, n, sp + 1);
+                evals.push(e1);
+                evals.push(e2);
+                hi = sp;
+                continue;
+            }
+            qr_window(work, n, sp + 1, hi, evals, it)?;
+            hi = sp;
+            continue;
+        }
+        // 双移位 QR 步；每 10 步无收缩改用异常移位
+        if stall % 10 == 9 {
+            let exc =
+                0.75f64 * (gj_mag(work[hi * n + hi - 1]) + gj_mag(work[(hi - 1) * n + hi - 2]));
+            let base = work[hi * n + hi];
+            qr_shift_step(work, n, lo, hi + 1, (base.0 + 0.75 * exc, base.1));
+        } else {
+            qr_double_step(work, n, lo, hi + 1);
+        }
+        stall += 1;
+        *it += 1;
+        if *it > 60 * n {
+            return Err(PyValueError::new_err(
+                "QR eigenvalue iteration did not converge",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// n≥9 大矩阵特征值核心：Hessenberg 相似约化 + dlahqr 式双移位 QR
+/// 迭代（语义与 Python _hessenberg_reduce/_qr_iter_eigvals 逐条对齐，
+/// 含尾块 1x1/2x2 提取、每 10 步异常移位、60n 步不收敛报错）。
+/// 实输入复算术残留的微小虚部归零（|imag| < 1e-11·max(1,|real|)，
+/// 同 Python 版）；不收敛 → Err，由 Python 回退 FL+DK。
+#[pyfunction]
+fn eigvals_qr_core(a: &NdArray) -> PyResult<NdArray> {
+    let shape: Vec<usize> = a.data.shape().to_vec();
+    if shape.len() != 2 || shape[0] != shape[1] {
+        return Err(PyValueError::new_err(
+            "eigvals_qr_core: a must be square (n, n)",
+        ));
+    }
+    let n = shape[0];
+    let mut work: Vec<(f64, f64)> = match &a.imag {
+        None => a.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => a
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    hessenberg_reduce(&mut work, n);
+    let mut evals: Vec<(f64, f64)> = vec![];
+    let mut it = 0usize;
+    if n > 0 {
+        qr_window(&mut work, n, 0, n - 1, &mut evals, &mut it)?;
+    }
+    let out: Vec<(f64, f64)> = evals
+        .iter()
+        .map(|z| {
+            if z.1.abs() < 1e-11 * f64::max(1.0, z.0.abs()) {
+                (z.0, 0.0)
+            } else {
+                *z
+            }
+        })
+        .collect();
+    let out_re: Vec<f64> = out.iter().map(|z| z.0).collect();
+    let out_im: Vec<f64> = out.iter().map(|z| z.1).collect();
+    let data = Array::from_shape_vec(IxDyn(&[n]), out_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let imag = Array::from_shape_vec(IxDyn(&[n]), out_im)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        data,
+        imag: Some(imag),
+    })
+}
+
+/// 批量特征值：stacked (..., n, n) 一次 FFI 内逐批 QR 迭代（消除
+/// Python 侧逐批内核调用 + wrap/tolist 往返）。要求 n ≥ 9（n<8 的
+/// FL+DK 小矩阵语义保持 Python），n<9 或非方阵 → Err。
+/// 返回 (evals (B, n) complex, ok (B,) f64)：单批不收敛 → 该行 NaN
+/// 且 ok=0，由 Python 侧对该批回退纯 Python。
+#[pyfunction]
+fn eigvals_qr_batch_core(a: &NdArray) -> PyResult<(NdArray, NdArray)> {
+    let shape: Vec<usize> = a.data.shape().to_vec();
+    if shape.len() < 3 {
+        return Err(PyValueError::new_err(
+            "eigvals_qr_batch_core: a must be (..., n, n)",
+        ));
+    }
+    let n = shape[shape.len() - 1];
+    if shape[shape.len() - 2] != n {
+        return Err(PyValueError::new_err(
+            "eigvals_qr_batch_core: a must be square (..., n, n)",
+        ));
+    }
+    if n < 9 {
+        return Err(PyValueError::new_err(
+            "eigvals_qr_batch_core: n < 9 stays on the Python FL+DK path",
+        ));
+    }
+    let b: usize = shape[..shape.len() - 2].iter().product();
+    let nn = n * n;
+    let mut out_re = vec![f64::NAN; b * n];
+    let mut out_im = vec![f64::NAN; b * n];
+    let mut ok = vec![1.0f64; b];
+    for bi in 0..b {
+        let base = bi * nn;
+        let mut work: Vec<(f64, f64)> = match &a.imag {
+            None => a
+                .data
+                .iter()
+                .skip(base)
+                .take(nn)
+                .map(|&r| (r, 0.0))
+                .collect(),
+            Some(im) => a
+                .data
+                .iter()
+                .zip(im.iter())
+                .skip(base)
+                .take(nn)
+                .map(|(&r, &i)| (r, i))
+                .collect(),
+        };
+        hessenberg_reduce(&mut work, n);
+        let mut evals: Vec<(f64, f64)> = vec![];
+        let mut it = 0usize;
+        match qr_window(&mut work, n, 0, n - 1, &mut evals, &mut it) {
+            Ok(()) => {
+                for (i, z) in evals.iter().enumerate() {
+                    if z.1.abs() < 1e-11 * f64::max(1.0, z.0.abs()) {
+                        out_re[bi * n + i] = z.0;
+                        out_im[bi * n + i] = 0.0;
+                    } else {
+                        out_re[bi * n + i] = z.0;
+                        out_im[bi * n + i] = z.1;
+                    }
+                }
+            }
+            Err(_) => {
+                ok[bi] = 0.0;
+            }
+        }
+    }
+    let data = Array::from_shape_vec(IxDyn(&[b, n]), out_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let imag = Array::from_shape_vec(IxDyn(&[b, n]), out_im)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let ok_arr =
+        Array::from_shape_vec(IxDyn(&[b]), ok).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((
+        NdArray {
+            data,
+            imag: Some(imag),
+        },
+        NdArray {
+            data: ok_arr,
+            imag: None,
+        },
+    ))
+}
+
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dot, m)?)?;
     m.add_function(wrap_pyfunction!(vdot, m)?)?;
@@ -1959,5 +3462,12 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(svdvals, m)?)?;
     m.add_function(wrap_pyfunction!(eigh, m)?)?;
     m.add_function(wrap_pyfunction!(solve_banded, m)?)?;
+    m.add_function(wrap_pyfunction!(gj_solve_core, m)?)?;
+    m.add_function(wrap_pyfunction!(svd_jacobi_sig, m)?)?;
+    m.add_function(wrap_pyfunction!(svd_jacobi_uv, m)?)?;
+    m.add_function(wrap_pyfunction!(svd_assemble_core, m)?)?;
+    m.add_function(wrap_pyfunction!(qr_householder_core, m)?)?;
+    m.add_function(wrap_pyfunction!(eigvals_qr_core, m)?)?;
+    m.add_function(wrap_pyfunction!(eigvals_qr_batch_core, m)?)?;
     Ok(())
 }
