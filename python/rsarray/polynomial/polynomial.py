@@ -527,7 +527,8 @@ def polyfit(x, y, deg, rcond=None, full=False, w=None, cov=False):
         try:
             import rsarray.num_core as _core_pf
             _w_arr = NX.asarray(w)._array if w is not None else None
-            _rows_arr = _core_pf.polyfit_rows_core(x._array, order, _w_arr)
+            _rows_arr = _core_pf.polyfit_rows_core(x._array, order, _w_arr,
+                                                   False)
             _Y = y._array if y.ndim == 1 else \
                 NX.array([list(row) for row in yvals])
             _sol, _resids, _rank, _sv = NX.linalg.lstsq(

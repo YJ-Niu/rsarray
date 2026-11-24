@@ -15,7 +15,7 @@ import rsarray.num_core as _core
 
 
 __all__ = [
-    'fft', 'ifft', 'rfft', 'irfft', 'irfftn',
+    'fft', 'ifft', 'rfft', 'irfft', 'irfftn', 'fft2', 'ifft2',
     'fftshift', 'ifftshift', 'fftfreq', 'rfftfreq',
 ]
 
@@ -151,6 +151,40 @@ def ifft(a, n=None, axis=-1, norm=None):
 def rfft(a, n=None, axis=-1, norm=None):
     """计算实输入的一维离散傅里叶变换。"""
     return _fft_nd(a, n, axis, norm, 'rfft', is_inverse=False)
+
+
+def fft2(a, s=None, axes=(-2, -1), norm=None):
+    """二维离散傅里叶变换：沿 axes 两轴各做一次一维 fft。"""
+    import rsarray as _np_mod
+    arr = a if hasattr(a, '_array') else _np_mod.asarray(a)
+    ndim = arr.ndim
+    if ndim < 2:
+        raise ValueError("fft2 requires at least a 2-D array")
+    axs = tuple(ax if ax >= 0 else ax + ndim for ax in axes)
+    if len(axs) != 2:
+        raise ValueError("fft2 requires exactly two axes")
+    out = a
+    for i, ax in enumerate(reversed(axs)):
+        n = s[i] if s else None
+        out = fft(out, n=n, axis=ax, norm=norm)
+    return out
+
+
+def ifft2(a, s=None, axes=(-2, -1), norm=None):
+    """二维逆离散傅里叶变换：沿 axes 两轴各做一次一维 ifft。"""
+    import rsarray as _np_mod
+    arr = a if hasattr(a, '_array') else _np_mod.asarray(a)
+    ndim = arr.ndim
+    if ndim < 2:
+        raise ValueError("ifft2 requires at least a 2-D array")
+    axs = tuple(ax if ax >= 0 else ax + ndim for ax in axes)
+    if len(axs) != 2:
+        raise ValueError("ifft2 requires exactly two axes")
+    out = a
+    for i, ax in enumerate(reversed(axs)):
+        n = s[i] if s else None
+        out = ifft(out, n=n, axis=ax, norm=norm)
+    return out
 
 
 def irfft(a, n=None, axis=-1, norm=None):

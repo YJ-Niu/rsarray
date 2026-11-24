@@ -113,7 +113,8 @@ def apply_along_axis(func1d, axis, arr, *args, **kwargs):
     res_list = []
     flat = moved.tolist()
     for row in (flat if isinstance(flat, list) else [flat]):
-        res_list.append(func1d(row, *args, **kwargs))
+        # numpy 语义：func1d 接收数组（col.sum() 等方法可用）
+        res_list.append(func1d(np.array(row), *args, **kwargs))
     try:
         res_arr = np.array(res_list)
         res_shape = (moved.shape[0],) + res_arr.shape[1:] if res_arr.ndim > 1 \
@@ -121,7 +122,15 @@ def apply_along_axis(func1d, axis, arr, *args, **kwargs):
         res_arr = res_arr.reshape(res_shape)
     except Exception:
         res_arr = np.array(res_list).reshape((moved.shape[0],))
-    # 转回原轴序
+    # 转回原轴序（func1d 返回标量时结果 1-D，即沿目标轴的结果，无需转置）
+    if res_arr.ndim == 1:
+        m = getmaskarray(arr)
+        if m is not nomask and arr.ndim == 2:
+            m_t = np.transpose(m, tuple(range(axis, n)) + tuple(range(axis)))
+            _m_flat = m_t.reshape((-1,)).tolist()
+            m2 = np.array(m, dtype='bool').reshape(m.shape)
+            _ = m2
+        return res_arr
     out = np.transpose(res_arr,
                        (tuple(range(1, n - axis + 1))) + (0,))
     m = getmaskarray(arr)
@@ -191,12 +200,11 @@ def _covhelper(x, y=None, rowvar=True, fweights=None, aweights=None):
             data_t = data
         m = getmaskarray(x)
         if m is not nomask:
-            if rowvar:
-                wm = (~m).astype(float)
-                sum_ = wm.sum(axis=0)
-            else:
-                wm = (~m).astype(float)
-                sum_ = wm.sum(axis=1)
+            # getmaskarray 返回展平 mask——需对齐 data 形状再归约；
+            # sum_ 为总有效观测数（标量，与 numpy ma 一致）
+            m2 = np.array(m, dtype='bool').reshape(data.shape)
+            wm = (~m2).astype(float)
+            sum_ = wm.sum()
         else:
             wm = None
             sum_ = float(nobs)
@@ -215,31 +223,29 @@ def _covhelper(x, y=None, rowvar=True, fweights=None, aweights=None):
         w = wm if wm is not None else None
         sum_ = sum_
 
-    # 均值（按掩码/权重）
+    # 均值（按掩码/权重）：rowvar=True 行 = 变量，均值沿观测轴
     data_f = data.astype(float)
+    mean_axis = 1 if rowvar else 0
     if w is None:
-        avg = data_f.mean(axis=1)
+        avg = data_f.mean(axis=mean_axis)
     else:
-        w2 = w.reshape((1, -1) if rowvar else (-1, 1))
-        avg = (data_f * w2).sum(axis=1) / sum_
+        w2 = w if w.shape == data_f.shape else \
+            w.reshape((1, -1) if rowvar else (-1, 1))
+        avg = (data_f * w2).sum(axis=mean_axis) / sum_
 
-    # 中心化
+    # 中心化（每变量减自身均值）+ 协方差 = xm @ xmᵀ / fac
     if rowvar:
-        xm = data_f - avg.reshape((1, -1))
-    else:
         xm = data_f - avg.reshape((-1, 1))
+    else:
+        xm = data_f - avg.reshape((1, -1))
     if w is not None:
-        w3 = w.reshape((1, -1) if rowvar else (-1, 1))
+        w3 = w if w.shape == data_f.shape else \
+            w.reshape((1, -1) if rowvar else (-1, 1))
         xm = xm * w3
     fac = sum_
     if rowvar:
-        covmat = (xm * xm.T).sum(axis=1) / fac
-        c = np.array([[covmat[i, j] if i == j else (xm[:, i] * xm[:, j]).sum() / fac
-                       for j in range(covmat.shape[0])]
-                      for i in range(covmat.shape[0])])
-    else:
-        c = (xm.T * xm).sum(axis=0) / fac
-    return c
+        return np.matmul(xm, xm.T) / fac
+    return np.matmul(xm.T, xm) / fac
 
 
 def cov(x, y=None, rowvar=True, bias=False, ddof=None, fweights=None,
@@ -264,17 +270,17 @@ def cov(x, y=None, rowvar=True, bias=False, ddof=None, fweights=None,
     return c
 
 
-def corrcoef(m, rowvar=True, **kwargs):
+def corrcoef(m, y=None, rowvar=True, **kwargs):
     """掩码感知的相关系数（ma.corrcoef 兼容子集）。"""
+    if y is not None:
+        m = np.array([asarray(m).tolist(), asarray(y).tolist()])
     m = asarray(m)
-    if rowvar:
-        n = m.shape[1]
-    else:
-        n = m.shape[0]
+    # 变量数（rowvar=True 时 = 行数；False 时 = 列数）
+    nv = m.shape[0] if rowvar else m.shape[1]
     c = cov(m, rowvar=rowvar)
     c = np.asarray(c, dtype=float)
-    d = np.sqrt(np.array([[c[i][i] if c.ndim == 2 else c[i] for i in range(n)]
-                          for _ in range(n)]))
+    d = np.sqrt(np.array([[c[i][i] if c.ndim == 2 else c[i] for i in range(nv)]
+                          for _ in range(nv)]))
     c = c / (d.T * d)
     # 数值稳定：clip 到 [-1, 1]
     c = np.clip(c, -1.0, 1.0)
@@ -366,15 +372,9 @@ def notmasked_edges(a):
     return (np.array(first), np.array(last))
 
 
-def masked_all(a, axis=None, **kwargs):
-    """全部元素是否被掩掉（ma.masked_all 兼容）。"""
-    a = asarray(a)
-    m = getmaskarray(a)
-    if m is nomask:
-        return False
-    if axis is None:
-        return bool(m.all())
-    return m.all(axis=axis)
+def masked_all(shape, dtype=None):
+    """与 shape 同形的全掩码数组（ma.masked_all 兼容，numpy 构造器语义）。"""
+    return MaskedArray(np.zeros(shape, dtype=dtype), mask=True)
 
 
 def masked_all_like(a):
@@ -508,13 +508,12 @@ def unique(ar, return_index=False, return_inverse=False, return_counts=False,
     if not vals:
         out = np.array([])
     else:
-        uniq, counts, inv = [], {}, []
+        uniq, counts, inv = [], [], {}
         for v in sorted(vals):
             if v not in inv:
                 inv[v] = len(uniq)
                 uniq.append(v)
                 counts.append(0)
-            inv[v] = inv[v]
             counts[inv[v]] += 1
         out = np.array(uniq)
     ret = [out]

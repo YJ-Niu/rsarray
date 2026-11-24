@@ -3727,14 +3727,26 @@ fn median_core(a: &NdArray, nan_filter: bool) -> PyResult<NdArray> {
                     .then(x.1.partial_cmp(&y.1).unwrap())
             });
         } else {
-            vals.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap());
+            // O(n) 选择替代全排序：中位只需要中位元素本身
+            let half = n / 2;
+            vals.select_nth_unstable_by(half, |x, y| x.0.partial_cmp(&y.0).unwrap());
         }
         if n % 2 == 1 {
             vals[n / 2]
         } else {
-            let x = vals[n / 2 - 1];
-            let y = vals[n / 2];
-            ((x.0 + y.0) / 2.0, (x.1 + y.1) / 2.0)
+            // 偶数：选出较大中位元素后，在其前缀中选较小中位元素
+            if has_imag {
+                let x = vals[n / 2 - 1];
+                let y = vals[n / 2];
+                ((x.0 + y.0) / 2.0, (x.1 + y.1) / 2.0)
+            } else {
+                let y = vals[n / 2].0;
+                let half = n / 2;
+                vals[..=half]
+                    .select_nth_unstable_by(half - 1, |a, b| a.0.partial_cmp(&b.0).unwrap());
+                let lo = vals[half - 1].0;
+                ((lo + y) / 2.0, 0.0)
+            }
         }
     };
     let data = Array::from_shape_vec(IxDyn(&[1]), vec![r.0])

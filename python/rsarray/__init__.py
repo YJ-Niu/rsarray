@@ -9366,6 +9366,10 @@ def _like_subok_result(result, a, subok):
 
 def zeros_like(a, dtype=None, order='K', subok=True, shape=None, device=None):
     """返回与输入形状相同的零数组（shape 参数可覆盖目标形状）。"""
+    # MaskedArray 输入：对 data 构造（numpy 语义 zeros_like(ma) → 普通数组）
+    if hasattr(a, '_mask') and not isinstance(a, ndarray):
+        return zeros_like(a._data, dtype=dtype, order=order, subok=subok,
+                          shape=shape, device=device)
     arr = ndarray(a)
     if isinstance(dtype, str):
         _parse_str_dtype(dtype)  # 校验 dtype 字符串（非法宽度如 'S-1' → TypeError）
@@ -10061,6 +10065,25 @@ def ix_(*args):
 def where(condition, x=None, y=None):
     """根据条件返回元素或索引。"""
     if x is not None and y is not None:
+        # 标量分支广播（numpy 语义：x/y 可为标量；core where 只接受
+        # ndarray → 数值标量按条件形状展开）
+        def _to_arr(v):
+            if hasattr(v, 'shape'):
+                return v
+            if isinstance(v, (bool, int, float, complex)):
+                # dtype 推断：bool > int > float > complex（numpy 语义）
+                if isinstance(v, bool):
+                    _dt = 'bool'
+                elif isinstance(v, int):
+                    _dt = 'int64'
+                elif isinstance(v, float):
+                    _dt = 'float64'
+                else:
+                    _dt = 'complex128'
+                return full(tuple(asarray(condition).shape), v, dtype=_dt)
+            return v
+        x = _to_arr(x)
+        y = _to_arr(y)
         dtype = getattr(x, '_dtype', 'float64')
         # complex 路径：Rust 核 where 丢弃虚部（1+2j → 1.0），拆成实/虚两次
         # where 再组合（纯 Python），避免触碰 Rust 核心。
