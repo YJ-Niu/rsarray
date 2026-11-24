@@ -236,6 +236,16 @@ def polyfit(x, y, deg, rcond=None, full=False, w=None, cov=False):
     # 按列缩放改善条件数
     scale = NX.sqrt((lhs * lhs).sum(axis=0))
     lhs = lhs / scale
+    # 默认路径快车道（full=False, cov=False, 1-D rhs）：正规方程内核
+    #（O(n·d²) 单遍；Cholesky 非正定 → Err 回退 SVD 保留 rank 语义）
+    if not full and not cov and rhs.ndim == 1:
+        try:
+            import rsarray.num_core as _core_pfn
+            _c = NX.ndarray._wrap(
+                _core_pfn.polyfit_normal_core(lhs._array, rhs._array))
+            return _c / scale
+        except Exception:
+            pass
     c, resids, rank, s = NX.linalg.lstsq(lhs, rhs, rcond)
     if rhs.ndim == 1 and getattr(c, 'ndim', 0) == 2:
         # lstsq 对 1-D b 可能返回 (n,1) → 压平为 (n,)
