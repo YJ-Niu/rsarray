@@ -2972,6 +2972,389 @@ fn qr_householder_core(a: &NdArray, want_complete: bool) -> PyResult<(NdArray, N
     ))
 }
 
+/// 复平方根主支（cmath.sqrt 语义）
+#[inline]
+fn csqrt(z: (f64, f64)) -> (f64, f64) {
+    let (r, i) = z;
+    if r == 0.0 && i == 0.0 {
+        return (0.0, 0.0);
+    }
+    let m = gj_mag(z);
+    let re = ((m + r) / 2.0).sqrt();
+    let im = if i >= 0.0 {
+        ((m - r) / 2.0).sqrt()
+    } else {
+        -((m - r) / 2.0).sqrt()
+    };
+    (re, im)
+}
+
+/// 2x2 块特征值（降序），语义同 Python _2x2
+fn eig2(work: &[(f64, f64)], n: usize, lo: usize) -> ((f64, f64), (f64, f64)) {
+    let a = work[lo * n + lo];
+    let b = work[lo * n + lo + 1];
+    let c = work[(lo + 1) * n + lo];
+    let d = work[(lo + 1) * n + lo + 1];
+    let tr = (a.0 + d.0, a.1 + d.1);
+    // det = a*d - b*c（复数）
+    let det = (
+        a.0 * d.0 - a.1 * d.1 - (b.0 * c.0 - b.1 * c.1),
+        a.0 * d.1 + a.1 * d.0 - (b.0 * c.1 + b.1 * c.0),
+    );
+    // disc = sqrt(tr² - 4det)
+    let disc = csqrt((
+        tr.0 * tr.0 - tr.1 * tr.1 - 4.0 * det.0,
+        2.0 * tr.0 * tr.1 - 4.0 * det.1,
+    ));
+    let e1 = ((tr.0 + disc.0) / 2.0, (tr.1 + disc.1) / 2.0);
+    let e2 = ((tr.0 - disc.0) / 2.0, (tr.1 - disc.1) / 2.0);
+    (e1, e2)
+}
+
+/// Hessenberg 相似约化（复 Householder），语义与 Python
+/// _hessenberg_reduce 逐条对齐
+fn hessenberg_reduce(work: &mut [(f64, f64)], n: usize) {
+    if n <= 2 {
+        return;
+    }
+    for j in 0..(n - 2) {
+        let lo = j + 1;
+        let mut norm2 = 0.0f64;
+        for t in lo..n {
+            norm2 += gj_mag(work[t * n + j]).powi(2);
+        }
+        let norm_x = norm2.sqrt();
+        if norm_x == 0.0 {
+            continue;
+        }
+        let x0 = work[lo * n + j];
+        let sgn: (f64, f64) = if gj_mag(x0) > 0.0 {
+            cdiv_r(x0, gj_mag(x0))
+        } else {
+            (1.0, 0.0)
+        };
+        let mut v: Vec<(f64, f64)> = (lo..n).map(|t| work[t * n + j]).collect();
+        v[0] = (v[0].0 + sgn.0 * norm_x, v[0].1 + sgn.1 * norm_x);
+        let mut nv2 = 0.0f64;
+        for t in v.iter() {
+            nv2 += gj_mag(*t).powi(2);
+        }
+        let nv = nv2.sqrt();
+        if nv == 0.0 {
+            continue;
+        }
+        for t in v.iter_mut() {
+            *t = cdiv_r(*t, nv);
+        }
+        // w = v^H A[:, j..]（先从未修改的 A 完整算出）
+        for c in j..n {
+            let mut w = (0.0, 0.0);
+            for t in lo..n {
+                let p = cj_mul(v[t - lo], work[t * n + c]);
+                w = (w.0 + p.0, w.1 + p.1);
+            }
+            for r in lo..n {
+                let t = sc_mul(v[r - lo], 2.0);
+                let wv = work[r * n + c];
+                let t2 = gj_cmul(t, w);
+                work[r * n + c] = (wv.0 - t2.0, wv.1 - t2.1);
+            }
+        }
+        // 右乘 P：(AP)[r][c] = A[r][c] - 2(Av)[r]·conj(v[c])
+        let mut avs = vec![(0.0, 0.0); n];
+        for r in 0..n {
+            let mut acc = (0.0, 0.0);
+            for t in lo..n {
+                let p = gj_cmul(work[r * n + t], v[t - lo]);
+                acc = (acc.0 + p.0, acc.1 + p.1);
+            }
+            avs[r] = acc;
+        }
+        for c in lo..n {
+            let vc = cj(v[c - lo]);
+            for r in 0..n {
+                let t = sc_mul(avs[r], 2.0);
+                let t2 = gj_cmul(t, vc);
+                let wv = work[r * n + c];
+                work[r * n + c] = (wv.0 - t2.0, wv.1 - t2.1);
+            }
+        }
+    }
+}
+
+/// H[i:m, i:m] - qI 的 Householder QR，返回 (Q, R)（语义同 _qr_factor）
+fn qr_factor(
+    work: &[(f64, f64)],
+    n: usize,
+    i: usize,
+    m: usize,
+    q_shift: (f64, f64),
+) -> (Vec<(f64, f64)>, Vec<(f64, f64)>) {
+    let k = m - i;
+    let mut r = vec![(0.0, 0.0); k * k];
+    for r_ in 0..k {
+        for c in 0..k {
+            let mut v = work[(i + r_) * n + i + c];
+            if r_ == c {
+                v = (v.0 - q_shift.0, v.1 - q_shift.1);
+            }
+            r[r_ * k + c] = v;
+        }
+    }
+    let mut qq: Vec<(f64, f64)> = vec![(0.0, 0.0); k * k];
+    for c in 0..k {
+        qq[c * k + c] = (1.0, 0.0);
+    }
+    if k == 0 {
+        return (qq, r);
+    }
+    for j in 0..k.saturating_sub(1) {
+        let mut norm2 = 0.0f64;
+        for t in j..k {
+            norm2 += gj_mag(r[t * k + j]).powi(2);
+        }
+        let norm_x = norm2.sqrt();
+        if norm_x == 0.0 {
+            continue;
+        }
+        let x0 = r[j * k + j];
+        let sgn: (f64, f64) = if gj_mag(x0) > 0.0 {
+            cdiv_r(x0, gj_mag(x0))
+        } else {
+            (1.0, 0.0)
+        };
+        let mut v: Vec<(f64, f64)> = (j..k).map(|t| r[t * k + j]).collect();
+        v[0] = (v[0].0 + sgn.0 * norm_x, v[0].1 + sgn.1 * norm_x);
+        let mut nv2 = 0.0f64;
+        for t in v.iter() {
+            nv2 += gj_mag(*t).powi(2);
+        }
+        let nv = nv2.sqrt();
+        if nv == 0.0 {
+            continue;
+        }
+        for t in v.iter_mut() {
+            *t = cdiv_r(*t, nv);
+        }
+        // R <- P R
+        for c in j..k {
+            let mut w = (0.0, 0.0);
+            for t in j..k {
+                let p = cj_mul(v[t - j], r[t * k + c]);
+                w = (w.0 + p.0, w.1 + p.1);
+            }
+            for r_ in j..k {
+                let t = sc_mul(v[r_ - j], 2.0);
+                let t2 = gj_cmul(t, w);
+                let wv = r[r_ * k + c];
+                r[r_ * k + c] = (wv.0 - t2.0, wv.1 - t2.1);
+            }
+        }
+        // Q <- Q P
+        for r_ in 0..k {
+            let mut qv = (0.0, 0.0);
+            for t in j..k {
+                let p = gj_cmul(qq[r_ * k + t], v[t - j]);
+                qv = (qv.0 + p.0, qv.1 + p.1);
+            }
+            if qv == (0.0, 0.0) {
+                continue;
+            }
+            for c in j..k {
+                let t = sc_mul(qv, 2.0);
+                let t2 = gj_cmul(t, cj(v[c - j]));
+                let wv = qq[r_ * k + c];
+                qq[r_ * k + c] = (wv.0 - t2.0, wv.1 - t2.1);
+            }
+        }
+    }
+    (qq, r)
+}
+
+/// 单位移 QR 步：B = block - qI = QR → block = RQ + qI（原地回写）
+fn qr_shift_step(work: &mut [(f64, f64)], n: usize, i: usize, m: usize, q_shift: (f64, f64)) {
+    let k = m - i;
+    let (qq, r) = qr_factor(work, n, i, m, q_shift);
+    for r_ in 0..k {
+        for c in 0..k {
+            let mut acc = (0.0, 0.0);
+            for t in 0..k {
+                let p = gj_cmul(r[r_ * k + t], qq[t * k + c]);
+                acc = (acc.0 + p.0, acc.1 + p.1);
+            }
+            let v = if r_ == c {
+                (acc.0 + q_shift.0, acc.1 + q_shift.1)
+            } else {
+                acc
+            };
+            work[(i + r_) * n + i + c] = v;
+        }
+    }
+}
+
+/// Francis 显式双移位步：移位取尾部 2x2 块的两个特征值
+fn qr_double_step(work: &mut [(f64, f64)], n: usize, i: usize, m: usize) {
+    let (a, b, c, d) = (
+        work[(m - 2) * n + m - 2],
+        work[(m - 2) * n + m - 1],
+        work[(m - 1) * n + m - 2],
+        work[(m - 1) * n + m - 1],
+    );
+    let tr = (a.0 + d.0, a.1 + d.1);
+    let det = (
+        a.0 * d.0 - a.1 * d.1 - (b.0 * c.0 - b.1 * c.1),
+        a.0 * d.1 + a.1 * d.0 - (b.0 * c.1 + b.1 * c.0),
+    );
+    let disc = csqrt((
+        tr.0 * tr.0 - tr.1 * tr.1 - 4.0 * det.0,
+        2.0 * tr.0 * tr.1 - 4.0 * det.1,
+    ));
+    qr_shift_step(
+        work,
+        n,
+        i,
+        m,
+        ((tr.0 + disc.0) / 2.0, (tr.1 + disc.1) / 2.0),
+    );
+    qr_shift_step(
+        work,
+        n,
+        i,
+        m,
+        ((tr.0 - disc.0) / 2.0, (tr.1 - disc.1) / 2.0),
+    );
+}
+
+/// dlahqr 式窗口递归驱动（语义同 _qr_iter_eigvals 的 _window）
+fn qr_window(
+    work: &mut [(f64, f64)],
+    n: usize,
+    lo0: usize,
+    mut hi: usize,
+    evals: &mut Vec<(f64, f64)>,
+    it: &mut usize,
+) -> PyResult<()> {
+    let eps = 2.220446049250313e-16;
+    let lo = lo0;
+    let mut stall = 0usize;
+    while hi + 1 > lo {
+        let size = hi - lo + 1;
+        if size == 1 {
+            evals.push(work[lo * n + lo]);
+            return Ok(());
+        }
+        if size == 2 {
+            let (e1, e2) = eig2(work, n, lo);
+            evals.push(e1);
+            evals.push(e2);
+            return Ok(());
+        }
+        // 从底部向上找第一个可收缩次对角元
+        let mut split: Option<usize> = None;
+        for jj in (lo..hi).rev() {
+            let sub = work[(jj + 1) * n + jj];
+            if sub == (0.0, 0.0) {
+                split = Some(jj);
+                break;
+            }
+            if gj_mag(sub)
+                <= eps * (gj_mag(work[jj * n + jj]) + gj_mag(work[(jj + 1) * n + jj + 1]))
+            {
+                work[(jj + 1) * n + jj] = (0.0, 0.0);
+                split = Some(jj);
+                break;
+            }
+        }
+        if let Some(sp) = split {
+            stall = 0;
+            let tsize = hi - sp;
+            if tsize == 1 {
+                evals.push(work[hi * n + hi]);
+                hi = sp;
+                continue;
+            }
+            if tsize == 2 {
+                let (e1, e2) = eig2(work, n, sp + 1);
+                evals.push(e1);
+                evals.push(e2);
+                hi = sp;
+                continue;
+            }
+            qr_window(work, n, sp + 1, hi, evals, it)?;
+            hi = sp;
+            continue;
+        }
+        // 双移位 QR 步；每 10 步无收缩改用异常移位
+        if stall % 10 == 9 {
+            let exc =
+                0.75f64 * (gj_mag(work[hi * n + hi - 1]) + gj_mag(work[(hi - 1) * n + hi - 2]));
+            let base = work[hi * n + hi];
+            qr_shift_step(work, n, lo, hi + 1, (base.0 + 0.75 * exc, base.1));
+        } else {
+            qr_double_step(work, n, lo, hi + 1);
+        }
+        stall += 1;
+        *it += 1;
+        if *it > 60 * n {
+            return Err(PyValueError::new_err(
+                "QR eigenvalue iteration did not converge",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// n≥9 大矩阵特征值核心：Hessenberg 相似约化 + dlahqr 式双移位 QR
+/// 迭代（语义与 Python _hessenberg_reduce/_qr_iter_eigvals 逐条对齐，
+/// 含尾块 1x1/2x2 提取、每 10 步异常移位、60n 步不收敛报错）。
+/// 实输入复算术残留的微小虚部归零（|imag| < 1e-11·max(1,|real|)，
+/// 同 Python 版）；不收敛 → Err，由 Python 回退 FL+DK。
+#[pyfunction]
+fn eigvals_qr_core(a: &NdArray) -> PyResult<NdArray> {
+    let shape: Vec<usize> = a.data.shape().to_vec();
+    if shape.len() != 2 || shape[0] != shape[1] {
+        return Err(PyValueError::new_err(
+            "eigvals_qr_core: a must be square (n, n)",
+        ));
+    }
+    let n = shape[0];
+    let mut work: Vec<(f64, f64)> = match &a.imag {
+        None => a.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => a
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    hessenberg_reduce(&mut work, n);
+    let mut evals: Vec<(f64, f64)> = vec![];
+    let mut it = 0usize;
+    if n > 0 {
+        qr_window(&mut work, n, 0, n - 1, &mut evals, &mut it)?;
+    }
+    let out: Vec<(f64, f64)> = evals
+        .iter()
+        .map(|z| {
+            if z.1.abs() < 1e-11 * f64::max(1.0, z.0.abs()) {
+                (z.0, 0.0)
+            } else {
+                *z
+            }
+        })
+        .collect();
+    let out_re: Vec<f64> = out.iter().map(|z| z.0).collect();
+    let out_im: Vec<f64> = out.iter().map(|z| z.1).collect();
+    let data = Array::from_shape_vec(IxDyn(&[n]), out_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let imag = Array::from_shape_vec(IxDyn(&[n]), out_im)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        data,
+        imag: Some(imag),
+    })
+}
+
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dot, m)?)?;
     m.add_function(wrap_pyfunction!(vdot, m)?)?;
@@ -2998,5 +3381,6 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(svd_jacobi_uv, m)?)?;
     m.add_function(wrap_pyfunction!(svd_assemble_core, m)?)?;
     m.add_function(wrap_pyfunction!(qr_householder_core, m)?)?;
+    m.add_function(wrap_pyfunction!(eigvals_qr_core, m)?)?;
     Ok(())
 }

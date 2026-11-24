@@ -106,5 +106,5 @@ def __getattr__(name):
                          f"attribute {name!r}")
 
 
-__all__ = ['as_strided', 'broadcast_arrays', 'broadcast_shapes',
+__all__ = ['as_strided', 'broadcast_arrays', 'broadcast_shapes',  # noqa: F822
            'broadcast_to', 'sliding_window_view', '_broadcast_shape']
