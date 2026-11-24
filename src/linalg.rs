@@ -2115,6 +2115,19 @@ fn cdiv_r(z: (f64, f64), r: f64) -> (f64, f64) {
     (z.0 / r, z.1 / r)
 }
 
+/// 复除复（CPython c_quot Smith 算法语义，与 Python complex/complex 位级一致）
+fn cdiv_c(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
+    if b.1.abs() <= b.0.abs() {
+        let ratio = b.1 / b.0;
+        let den = b.0 + ratio * b.1;
+        ((a.0 + a.1 * ratio) / den, (a.1 - a.0 * ratio) / den)
+    } else {
+        let ratio = b.0 / b.1;
+        let den = b.1 + ratio * b.0;
+        ((a.0 * ratio + a.1) / den, (a.1 * ratio - a.0) / den)
+    }
+}
+
 /// 复乘法（运算次序与 Python complex 一致）
 #[inline]
 fn gj_cmul(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
@@ -3524,6 +3537,155 @@ fn eig_power_core(a: &NdArray) -> PyResult<(NdArray, NdArray)> {
     ))
 }
 
+/// 复数列主元高斯消元（语义与 Python _solve_pivot 逐条对齐）：
+/// 奇异时用最大可用枢轴继续、零枢轴跳过、回代求 x。
+fn solve_pivot_c(a: &[(f64, f64)], b: &[(f64, f64)], n: usize) -> Vec<(f64, f64)> {
+    let mut work = a.to_vec();
+    let mut rhs = b.to_vec();
+    for col in 0..n {
+        let mut p = col;
+        let mut best = gj_mag(work[col * n + col]);
+        for r in col + 1..n {
+            let m = gj_mag(work[r * n + col]);
+            if m > best {
+                best = m;
+                p = r;
+            }
+        }
+        if p != col {
+            // 整行交换（work 是扁平行主序 n×n；Python 交换的是行）
+            for j in 0..n {
+                work.swap(col * n + j, p * n + j);
+            }
+            rhs.swap(col, p);
+        }
+        let pv = work[col * n + col];
+        if pv == (0.0, 0.0) {
+            continue;
+        }
+        for r in col + 1..n {
+            let f = cdiv_c(work[r * n + col], pv);
+            if f != (0.0, 0.0) {
+                for c2 in col..n {
+                    let t = gj_cmul(f, work[col * n + c2]);
+                    let w = work[r * n + c2];
+                    work[r * n + c2] = (w.0 - t.0, w.1 - t.1);
+                }
+                let t = gj_cmul(f, rhs[col]);
+                rhs[r] = (rhs[r].0 - t.0, rhs[r].1 - t.1);
+            }
+        }
+    }
+    let mut x = vec![(0.0, 0.0); n];
+    for r in (0..n).rev() {
+        let pv = work[r * n + r];
+        if pv == (0.0, 0.0) {
+            continue;
+        }
+        let mut s = rhs[r];
+        for c2 in r + 1..n {
+            let t = gj_cmul(work[r * n + c2], x[c2]);
+            s = (s.0 - t.0, s.1 - t.1);
+        }
+        x[r] = cdiv_c(s, pv);
+    }
+    x
+}
+
+/// 通用 n×n 特征向量（语义与 Python _eigenvectors_general 逐条对齐）：
+/// 对每个特征值 λ 构造正规方程 B = (A−λI)^H(A−λI)（B 近奇异，解的
+/// 方向即零空间 = 特征向量），依次以坐标方向 e_t 为右端解 Bv = e_t，
+/// 解范数 > 1e-8 时归一化采用；全失败用 e_0 兜底。evals 顺序与输出
+/// 列一一对应。返回 (n,n) 行主序 evecs（out[i][k] = 第 k 向量第 i 分量）。
+#[pyfunction]
+fn eig_vectors_core(a: &NdArray, evals: &NdArray) -> PyResult<NdArray> {
+    let shape: Vec<usize> = a.data.shape().to_vec();
+    if shape.len() != 2 || shape[0] != shape[1] || shape[0] == 0 {
+        return Err(PyValueError::new_err(
+            "eig_vectors_core: a must be non-empty (n, n)",
+        ));
+    }
+    let n = shape[0];
+    let mat: Vec<(f64, f64)> = match &a.imag {
+        None => a.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => a
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    if evals.data.len() != n {
+        return Err(PyValueError::new_err(
+            "eig_vectors_core: evals length mismatch",
+        ));
+    }
+    let evals_v: Vec<(f64, f64)> = match &evals.imag {
+        None => evals.data.iter().map(|&r| (r, 0.0)).collect(),
+        Some(im) => evals
+            .data
+            .iter()
+            .zip(im.iter())
+            .map(|(&r, &i)| (r, i))
+            .collect(),
+    };
+    let mut out = vec![(0.0, 0.0); n * n];
+    for (k, &lam) in evals_v.iter().enumerate() {
+        // B = (A−λI)^H (A−λI)
+        let mut b_mat = vec![(0.0, 0.0); n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = (0.0, 0.0);
+                for kk in 0..n {
+                    let mut aik = mat[kk * n + i];
+                    if kk == i {
+                        aik = (aik.0 - lam.0, aik.1 - lam.1);
+                    }
+                    let mut akj = mat[kk * n + j];
+                    if kk == j {
+                        akj = (akj.0 - lam.0, akj.1 - lam.1);
+                    }
+                    let p = cj_mul(aik, akj);
+                    s = (s.0 + p.0, s.1 + p.1);
+                }
+                b_mat[i * n + j] = s;
+            }
+        }
+        // 依次以 e_t 为右端解 Bv = e_t，解范数 > 1e-8 采用
+        let mut v: Option<Vec<(f64, f64)>> = None;
+        for t in 0..n {
+            let rhs: Vec<(f64, f64)> = (0..n)
+                .map(|i| if i == t { (1.0, 0.0) } else { (0.0, 0.0) })
+                .collect();
+            let cand = solve_pivot_c(&b_mat, &rhs, n);
+            let nrm_sq: f64 = cand.iter().map(|z| gj_mag(*z).powi(2)).sum();
+            let nrm = nrm_sq.sqrt();
+            if nrm > 1e-8 {
+                v = Some(cand.iter().map(|z| cdiv_r(*z, nrm)).collect());
+                break;
+            }
+        }
+        let v = v.unwrap_or_else(|| {
+            let mut x = vec![(0.0, 0.0); n];
+            x[0] = (1.0, 0.0);
+            x
+        });
+        for i in 0..n {
+            out[i * n + k] = v[i];
+        }
+    }
+    let out_re: Vec<f64> = out.iter().map(|z| z.0).collect();
+    let out_im: Vec<f64> = out.iter().map(|z| z.1).collect();
+    let data = Array::from_shape_vec(IxDyn(&[n, n]), out_re)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let imag = Array::from_shape_vec(IxDyn(&[n, n]), out_im)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(NdArray {
+        data,
+        imag: Some(imag),
+    })
+}
+
 pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dot, m)?)?;
     m.add_function(wrap_pyfunction!(vdot, m)?)?;
@@ -3552,6 +3714,7 @@ pub fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(qr_householder_core, m)?)?;
     m.add_function(wrap_pyfunction!(eigvals_qr_core, m)?)?;
     m.add_function(wrap_pyfunction!(eig_power_core, m)?)?;
+    m.add_function(wrap_pyfunction!(eig_vectors_core, m)?)?;
     m.add_function(wrap_pyfunction!(eigvals_qr_batch_core, m)?)?;
     Ok(())
 }

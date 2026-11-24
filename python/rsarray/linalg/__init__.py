@@ -273,7 +273,7 @@ def _pinv_general(mat):
     return _matmul_2d(v_inv, _matmul_2d(v_inv, at))
 
 
-def _eig_general(mat):
+def _eig_general(mat, arr=None):
     """通用特征值分解实现，支持复数矩阵。"""
     n = len(mat)
     if n == 1:
@@ -308,6 +308,16 @@ def _eig_general(mat):
         return _eig_power_iteration(mat)
     from ._pylinalg import _eigvals_qr, _eigenvectors_general
     evals = _eigvals_qr(mat)
+    # 特征向量 Rust 快路径（原始数组传入时）：消除 O(n⁴) Python 正规
+    # 方程 + 消元；失败回退纯 Python 版本
+    if arr is not None and hasattr(arr, '_array'):
+        try:
+            from rsarray import ndarray as _ndarr
+            ev_arr = _ndarr(list(evals), _dtype='complex128')._array
+            raw = _core.linalg.eig_vectors_core(arr._array, ev_arr)
+            return evals, _ndarr._wrap(raw).tolist()
+        except Exception:
+            pass
     return evals, _eigenvectors_general(mat, evals)
 
 
@@ -373,7 +383,7 @@ def _eig_one(mat):
             return (_nd._wrap(ev).tolist(), _nd._wrap(ec).tolist())
         except Exception:
             pass
-    return _eig_general(m)
+    return _eig_general(m, mat)
 
 
 def _gauss_jordan_solve(mat, b):
