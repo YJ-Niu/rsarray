@@ -720,44 +720,45 @@ fn cov(a: &NdArray, rowvar: bool) -> PyResult<NdArray> {
         (shape[1], shape[0])
     };
 
-    let rows: Vec<Vec<f64>> = if shape.len() == 1 {
-        vec![data_vec.clone()]
-    } else if rowvar {
-        (0..shape[0])
-            .map(|i| (0..shape[1]).map(|j| data_vec[i * shape[1] + j]).collect())
-            .collect()
-    } else {
-        (0..shape[1])
-            .map(|j| (0..shape[0]).map(|i| data_vec[i * shape[1] + j]).collect())
-            .collect()
-    };
-
-    let means: Vec<f64> = rows
-        .iter()
-        .map(|r| r.iter().sum::<f64>() / n_obs as f64)
-        .collect();
-    let centered: Vec<Vec<f64>> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, r)| r.iter().map(|&v| v - means[i]).collect())
-        .collect();
-
-    let mut cov_matrix = vec![vec![0.0; n_vars]; n_vars];
-    let factor = 1.0 / (n_obs as f64 - 1.0);
-    for k in 0..n_vars {
-        for j in 0..n_vars {
-            let mut s = 0.0;
-            for (ci, cj) in centered[k].iter().zip(centered[j].iter()) {
-                s += ci * cj;
-            }
-            cov_matrix[k][j] = s * factor;
+    // 扁平行主序 centered（cache 友好，替代 Vec<Vec> 间接寻址）
+    let mut centered = vec![0.0f64; n_vars * n_obs];
+    let transposed = shape.len() > 1 && !rowvar;
+    for i in 0..n_vars {
+        let mut mean_i = 0.0f64;
+        for j in 0..n_obs {
+            // 非行主（rowvar=False）：变量 i 的观测 j 在 data 的第 j 行
+            let raw = if transposed {
+                data_vec[j * shape[1] + i]
+            } else {
+                data_vec[i * n_obs + j]
+            };
+            mean_i += raw;
+        }
+        mean_i /= n_obs as f64;
+        for j in 0..n_obs {
+            let raw = if transposed {
+                data_vec[j * shape[1] + i]
+            } else {
+                data_vec[i * n_obs + j]
+            };
+            centered[i * n_obs + j] = raw - mean_i;
         }
     }
 
-    let mut flat = vec![0.0; n_vars * n_vars];
-    for i in 0..n_vars {
-        for j in 0..n_vars {
-            flat[i * n_vars + j] = cov_matrix[i][j];
+    // 对称矩阵：只算上三角（j >= k）后回填，省一半内积
+    let mut flat = vec![0.0f64; n_vars * n_vars];
+    let factor = 1.0 / (n_obs as f64 - 1.0);
+    for k in 0..n_vars {
+        let ck = &centered[k * n_obs..(k + 1) * n_obs];
+        for j in k..n_vars {
+            let cj = &centered[j * n_obs..(j + 1) * n_obs];
+            let mut s = 0.0;
+            for t in 0..n_obs {
+                s += ck[t] * cj[t];
+            }
+            let v = s * factor;
+            flat[k * n_vars + j] = v;
+            flat[j * n_vars + k] = v;
         }
     }
     let arr = Array::from_shape_vec(IxDyn(&[n_vars, n_vars]), flat)
@@ -1155,8 +1156,13 @@ fn nan_groups_allnan(x: &NdArray, axis: Option<isize>) -> PyResult<bool> {
 /// （w=None 时 √w=1；逐次累乘 p *= xv，幂次 0..=order）。实数输入；
 /// 复数 → Err（Python 复数路径兜底）。输出 (n, order+1)。
 #[pyfunction]
-#[pyo3(signature = (x, order, w))]
-fn polyfit_rows_core(x: &NdArray, order: usize, w: Option<NdArray>) -> PyResult<NdArray> {
+#[pyo3(signature = (x, order, w, descending=false))]
+fn polyfit_rows_core(
+    x: &NdArray,
+    order: usize,
+    w: Option<NdArray>,
+    descending: bool,
+) -> PyResult<NdArray> {
     if x.imag.is_some() {
         return Err(PyValueError::new_err("complex input"));
     }
@@ -1180,7 +1186,9 @@ fn polyfit_rows_core(x: &NdArray, order: usize, w: Option<NdArray>) -> PyResult<
         };
         let mut p = 1.0f64;
         for d in 0..=order {
-            out[i * (order + 1) + d] = p * sw;
+            // descending=true 时幂次从高到低（vander 列序）
+            let col = if descending { order - d } else { d };
+            out[i * (order + 1) + col] = p * sw;
             p *= xv;
         }
     }
@@ -1391,17 +1399,25 @@ fn nanmax(x: &NdArray, axis: Option<isize>, keepdims: bool) -> PyResult<NdArray>
     for out_o in 0..outer {
         for inn in 0..inner {
             let base = out_o * dim_size * inner;
-            let mut best: Option<f64> = None;
+            // 无分支快速路径：f64::max 自带忽略 NaN 语义；结果 -inf 时
+            // 再回退原循环区分全 NaN 与真 -inf
+            let mut best = f64::NEG_INFINITY;
             for i in 0..dim_size {
-                let v = data[base + i * inner + inn];
-                if !v.is_nan() {
-                    best = Some(match best {
-                        Some(b) if b >= v => b,
-                        _ => v,
-                    });
-                }
+                best = best.max(data[base + i * inner + inn]);
             }
-            out[o] = best.unwrap_or(f64::NAN);
+            out[o] = if best == f64::NEG_INFINITY && dim_size > 0 {
+                let mut any = false;
+                for i in 0..dim_size {
+                    let v = data[base + i * inner + inn];
+                    if !v.is_nan() {
+                        any = true;
+                        break;
+                    }
+                }
+                if any { best } else { f64::NAN }
+            } else {
+                best
+            };
             o += 1;
         }
     }
@@ -1431,17 +1447,25 @@ fn nanmin(x: &NdArray, axis: Option<isize>, keepdims: bool) -> PyResult<NdArray>
     for out_o in 0..outer {
         for inn in 0..inner {
             let base = out_o * dim_size * inner;
-            let mut best: Option<f64> = None;
+            // 无分支快速路径：f64::min 自带忽略 NaN 语义；结果 +inf 时
+            // 再回退原循环区分全 NaN 与真 +inf
+            let mut best = f64::INFINITY;
             for i in 0..dim_size {
-                let v = data[base + i * inner + inn];
-                if !v.is_nan() {
-                    best = Some(match best {
-                        Some(b) if b <= v => b,
-                        _ => v,
-                    });
-                }
+                best = best.min(data[base + i * inner + inn]);
             }
-            out[o] = best.unwrap_or(f64::NAN);
+            out[o] = if best == f64::INFINITY && dim_size > 0 {
+                let mut any = false;
+                for i in 0..dim_size {
+                    let v = data[base + i * inner + inn];
+                    if !v.is_nan() {
+                        any = true;
+                        break;
+                    }
+                }
+                if any { best } else { f64::NAN }
+            } else {
+                best
+            };
             o += 1;
         }
     }

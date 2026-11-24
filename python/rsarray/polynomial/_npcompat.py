@@ -220,8 +220,19 @@ def polyfit(x, y, deg, rcond=None, full=False, w=None, cov=False):
         raise TypeError("expected x and y to have same length")
     if rcond is None:
         rcond = len(x) * NX.finfo(x.dtype).eps
-    lhs = NX.vander(x, order)
     rhs = y
+    # 无权重 + 1-D rhs：Vandermonde（降序列）一步 Rust 内核（跳过 vander
+    # np.power 全量数组运算）；带 w 走原缩放路径（w 语义 = 满权缩放）
+    if w is None and rhs.ndim == 1 \
+            and str(getattr(x, '_dtype', ''))[:1] == 'f':
+        try:
+            import rsarray.num_core as _core_pf
+            lhs = NX.ndarray._wrap(
+                _core_pf.polyfit_rows_core(x._array, order - 1, None, True))
+        except Exception:
+            lhs = NX.vander(x, order)
+    else:
+        lhs = NX.vander(x, order)
     if w is not None:
         w = NX.asarray(w) + 0.0
         if w.ndim != 1:

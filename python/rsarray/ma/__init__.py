@@ -149,3 +149,16 @@ def mean(a, axis=None, dtype=None, out=None, keepdims=None):
     if keepdims is not None:
         kwargs['keepdims'] = keepdims
     return _stat_mean(filled_a, **kwargs)
+
+
+def concatenate(arrays, axis=0, out=None):
+    """掩码感知拼接：任一输入为 MaskedArray 时 data 拼接 + 掩码重建。"""
+    arrays = list(arrays)
+    if any(isinstance(a, MaskedArray) for a in arrays):
+        import rsarray as _np_mod
+        datas = [core.getdata(a) for a in arrays]
+        masks = [core.getmaskarray(a) for a in arrays]
+        out_d = _np_mod.concatenate(datas, axis=axis)
+        out_m = _np_mod.concatenate(masks, axis=axis)
+        return MaskedArray(out_d, mask=out_m)
+    return core.concatenate(arrays, axis=axis, out=out)

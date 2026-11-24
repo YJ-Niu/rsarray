@@ -6,7 +6,7 @@ MaskedRecords：基于结构化（记录）数据的掩码数组；逐记录访�
 """
 
 import rsarray as np
-from .core import MaskedArray, asarray
+from .core import MaskedArray, asarray, getmaskarray
 
 
 class _MaskedRecord(tuple):
@@ -38,6 +38,17 @@ class _MaskedRecord(tuple):
 
 class MaskedRecords(MaskedArray):
     """记录型掩码数组（ma.mrecords.MaskedRecords 兼容子集）。"""
+
+    def __getattr__(self, name):
+        # 字段属性访问（mr.a → 列 MaskedArray）；非字段名走常规路径
+        names = getattr(self._data.dtype, 'names', None)
+        if names and name in names:
+            return MaskedArray(self._data[name],
+                               mask=np.asarray(getmaskarray(self))[
+                                   :].reshape((-1,)) if self._mask
+                               is not False and self._mask is not None
+                               else False)
+        raise AttributeError(name)
 
     def __init__(self, data=None, mask=False, dtype=None, fill_value=None,
                  **kwargs):
