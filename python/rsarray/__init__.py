@@ -900,6 +900,9 @@ class ndarray:
         raw_list = self._array.tolist()
         if dt == 'int64':
             return _convert_nested(raw_list, int)
+        if dt in ('int8', 'int16', 'int32'):
+            # 底层为 f64 存储的窄有符号 int：tolist 按 numpy 语义返回 int
+            return _convert_nested(raw_list, int)
         if dt == 'bool':
             return _convert_nested(raw_list, builtins.bool)
         if dt in ('uint8', 'uint16', 'uint32', 'uint64'):
