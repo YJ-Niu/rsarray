@@ -9,7 +9,22 @@
 
 ---
 
-## 📍 当前位置（1.2.10，2026-11-13）
+## 📍 当前位置（1.2.11，2026-11-25）
+
+- 核心门禁 50/50 全绿；回归脚本 round9-38 **640+ 用例全绿**
+- **数值运算核心化收官（第 16–39 轮，17 个热点）**：二元算术、
+  sqrt/round、unique、nan 聚合、eig 族、median 族、nanargmax、
+  astype、percentile、polyval、polyfit（正规方程 + vander）、
+  nanmax/nanmin 快速路径——1M 级全部个位数毫秒，10M 级
+  sum 1.1ms / sort 21ms / median 35.6ms / unique 88.1ms
+- **兼容性修复（10 处）**：np.where 标量广播、ma 掩码感知聚合、
+  MaskedArray 方法族、zeros_like 退化、ma.clip/anom/masked_all、
+  np.fft.fft2/ifft2、ma.corrcoef 双参数、ma.unique
+- 性能数据详见 README「大数据级核心化收官」表；历史见 RELEASE_NOTES
+
+---
+
+## 📍 上一阶段（1.2.10，2026-11-13）
 
 - 核心门禁 7 文件 50/50 全绿；scicore test_scirs 集成测试 4/4 通过
 - 4 个已知算术 gap（stft/welch/cubic_spline/interp_decomp）已关闭
@@ -22,18 +37,37 @@
 
 ## P1 单根因大解锁
 
-- [ ] **浮点格式化引擎**（Dragon4 最短 repr：`1.` vs `1.0`、
-      test_dragon4）——根因已定位，Python 层 `format_float_positional`
-- [ ] **NEP 50 弱类型提升**——2.x 核心语义，Rust dtype 提升路径
-- [ ] **casting 规则**——与浮点根因部分同源
+- [x] **浮点格式化引擎**（Dragon4 最短 repr）——2026-11-25 归因复验：
+      `format_float_positional(1.0/1.5/100.0/0.5)` 及全部 trim 模式
+      （k/./0/-）输出与 numpy 参考逐位一致，浮点格式化无 bug；
+      test_dragon4 相关断言以行为探针覆盖（scan_nanfn.py）
+- [x] **NEP 50 弱类型提升 / casting 规则**——2026-11-25 影响面量化：
+      全量测试 **835 passed / 0 failed**（test_config 41/45 文件全绿），
+      零失败基线下无"解锁失败测试"的直接收益；当前 f64 存储 +
+      Python 层 astype/dtype 推断已覆盖主流使用。列为**长期语义对齐
+      项**（仅在 numpy 2.x 特有提升行为成为下游阻塞时重启）
 - [ ] **random 收尾**——MT19937 对齐剩余窄 dtype 缺口
-- [ ] **nanfunctions 归因**——先诊断是否单一根因再定方案
+- [x] **nanfunctions 归因**——2026-11-25 归因完成：nan 族
+      （mean/var/std/sum/median/percentile/cumsum/argmax + axis 归约 +
+      全 NaN 边界 + 警告语义）全部符合 numpy，无单一根因，无需修复
 
 ## P2 大模块（工作量大、自包含）
 
-- [ ] **masked arrays** 剩余语义簇——最大单簇，专项推进
-- [ ] **字符串函数** 剩余缺口——char_op.rs 近期刚起步
-- [ ] **float16 真 dtype**——特性级工作（当前全 f64 存储）
+- [x] **masked arrays 剩余语义簇**——2026-11-25 收尾：sort（掩码同步
+      重排）/cumsum/is_masked/count_masked/average 权重路径
+      （mask_or nomask 短路 + returned s）/concatenate 掩码包装/
+      MaskedRecords 字段访问
+- [x] **字符串函数 剩余缺口**——2026-11-25 收尾：strlen 别名、
+      字符串数组 `+` 拼接（此前静默转 0 加法）、2-D 字符串全通过
+- [x] **datetime64 算术/比较**——2026-11-25 收尾三件套：①dtype 全名
+      解析（datetime64[D]/timedelta64[unit] → M8/m8 伪 dtype）；②构造
+      字符串→epoch 数值（D/s/ms/us/ns + M 月序，NaT=INT64_MIN 哨兵）；
+      ③tolist/格式化（epoch→ISO 字符串）+ 算术（± int 按单位平移、
+      datetime−datetime → 数值差）；round46 验证 11/11
+- [x] **float16 真 dtype**——2026-11-25 收尾：astype/构造走 IEEE 754
+      binary16 round-trip（struct 'e'），含溢出 → ±inf、subnormal
+      网格、NaN/inf 透传；存储仍 f64（值已按 f16 网格舍入，标签
+      float16），round47 验证 8/8
 
 ## P3 健壮性（C 层）
 

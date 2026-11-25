@@ -77,7 +77,8 @@ del _n
 # ma 顶层亦暴露 extras 的常用名
 for _n in ('atleast_1d', 'atleast_2d', 'atleast_3d', 'average', 'clump',
            'clump_masked', 'clump_unmasked', 'compress_nd', 'compress_rowcols',
-           'corrcoef', 'cov', 'diagflat', 'ediff1d', 'flatnotmasked_contiguous',
+           'corrcoef', 'count_masked', 'cov', 'diagflat', 'ediff1d',
+           'flatnotmasked_contiguous',
            'in1d', 'intersect1d', 'isin', 'masked_all', 'masked_all_like',
            'mask_rowcols', 'mask_rows', 'mask_cols', 'median', 'mr_', 'ndenumerate', 'notmasked_contiguous',
            'notmasked_edges', 'polyfit', 'setdiff1d', 'setxor1d', 'stack',
@@ -151,7 +152,7 @@ def mean(a, axis=None, dtype=None, out=None, keepdims=None):
     return _stat_mean(filled_a, **kwargs)
 
 
-def concatenate(arrays, axis=0, out=None):
+def concatenate(arrays, axis=0, out=None):  # noqa: F811
     """掩码感知拼接：任一输入为 MaskedArray 时 data 拼接 + 掩码重建。"""
     arrays = list(arrays)
     if any(isinstance(a, MaskedArray) for a in arrays):
@@ -162,3 +163,15 @@ def concatenate(arrays, axis=0, out=None):
         out_m = _np_mod.concatenate(masks, axis=axis)
         return MaskedArray(out_d, mask=out_m)
     return core.concatenate(arrays, axis=axis, out=out)
+
+
+def sort(a, axis=-1, kind=None, order=None):
+    """掩码感知排序（ma.sort 兼容）：masked 元素排最后，掩码同步重排。
+
+    覆盖 statistics.sort 的裸绑定（后者对 MaskedArray 走 core sort，
+    负轴/掩码语义均缺失）；非 MaskedArray 输入回退普通 sort。
+    """
+    if isinstance(a, MaskedArray):
+        return a.sort(axis=axis, kind=kind, order=order)
+    from rsarray.statistics import sort as _stat_sort
+    return _stat_sort(a, axis=axis, kind=kind, order=order)

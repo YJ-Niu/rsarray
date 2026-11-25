@@ -6,6 +6,37 @@
 
 ---
 
+## v1.2.11 (2026-11-25) — 数值运算核心化收官（第 16–39 轮）
+
+### 性能（大数据级，10M float64 除注明外）
+
+- **逐元素/归约**：`add`/`sqrt`/`sum` 等全部个位数毫秒；`sort` 10M 21ms
+- **median**：10M 35.6ms——实数分支 O(n) `select_nth_unstable` 选择替代全排序
+- **nanmax/nanmin**：10M 27.7ms——无分支快速路径（`f64::max/min` 自带忽略 NaN）
+- **unique**：10M 88.1ms——`unique_1d_core` 快路径前移至递归展平之前（2106ms → 23x）
+- **percentile/median/quantile**：1M 2.5–2.8ms——`percentile_core` linear 虚指数插值内核
+- **median/percentile/nanpercentile（全归约）**：`median_core`（NaN 传染 + nan_filter 双语义 + complex 字典序）
+- **astype**：1M 2.8ms——数值转换内核（NaN→0、位宽补码回绕、bool 0/1、f32 舍入）
+- **np.polyfit**：deg2 100K 12.5ms——`polyfit_normal_core` Cholesky 正规方程 + Vandermonde 内核（秩亏回退 SVD）
+- **np.corrcoef/np.cov**：1000×100 13.8ms——对称矩阵上三角 + 扁平 centered
+- **np.where**：标量分支按条件形状广播（1M 6ms），dtype 推断 bool→int64→float64→complex128
+
+### 兼容性修复（10 处）
+
+- `np.where` 标量 x/y 分支（此前抛 TypeError）
+- `np.ma.sum/mean/prod` 掩码感知聚合（此前 masked 元素参与求和）
+- `np.ma.unique` `inv` 容器错位、`np.ma.corrcoef` 双参数、`ma.clip`、`anom` 掩码感知、`masked_all` 构造器语义
+- `zeros_like(MaskedArray)` 0-d 退化
+- `MaskedArray` 补 `sum/mean/prod/count/argmax/__float__/__int__` 方法族
+- 新增 `np.fft.fft2/ifft2`
+
+### 内部
+
+- `nanarg_core`/`nanmedian` 快路径、`has_nonfinite_core`/`replace_nan_core` 通用原语
+- 回归基线：round9-38 验证脚本 **640+ 用例全绿**；核心门禁 50/50
+
+---
+
 ## v1.2.9 (2026-10-26) — 平台支持收敛
 
 - **正式移除 Python 3.9 支持**：`requires-python >= 3.10`，不再为 3.9 构建与测试

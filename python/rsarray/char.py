@@ -1588,3 +1588,6 @@ def compare_chararrays(a1, a2, cmp='asciibetical', rstrip=False):
 
 compare_chararrays.__text_signature__ = (
     "(a1, a2, cmp='asciibetical', rstrip=False)")
+
+# numpy char.strlen 别名（str_len 既有实现）
+strlen = str_len

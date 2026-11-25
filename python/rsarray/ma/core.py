@@ -398,6 +398,24 @@ class MaskedArray:
             return MaskedArray(np.array(0.0), mask=[True])
         return MaskedArray(np.array(self._ma_filled_data(0.0).sum() / cnt))
 
+    def sort(self, axis=-1, kind=None, order=None):
+        """掩码感知排序：masked 元素排最后（ma 语义），掩码同步重排。"""
+        if axis is not None and axis < 0:
+            axis += self._data.ndim
+        # masked 填 +inf 后排序（排最后），argsort 索引同步重排掩码
+        filled_a = self._ma_filled_data(float('inf'))
+        idx = np.argsort(filled_a, axis=axis)
+        data_sorted = self._data[idx]
+        mask_sorted = np.asarray(getmaskarray(self), dtype='bool')[idx]
+        out = MaskedArray(data_sorted, mask=mask_sorted,
+                          fill_value=self.fill_value)
+        return out
+
+    def cumsum(self, axis=None, dtype=None, out=None):
+        """掩码感知累积和：masked 视为 0。"""
+        return MaskedArray(np.array(
+            self._ma_filled_data(0.0).cumsum(axis=axis)))
+
     def argmax(self, axis=None, out=None, keepdims=False):
         """掩码感知最大值索引：masked 位填 -inf 后取 argmax。"""
         filled_a = self._ma_filled_data(float('-inf'))
@@ -956,9 +974,10 @@ def mask_or(a, b):
     """两个掩码按位或（ma.mask_or 兼容）。"""
     ma_ = getmaskarray(a)
     mb_ = getmaskarray(b)
-    if ma_ is nomask:
+    # nomask（False）经 getmaskarray 退化为空数组——按空掩码短路
+    if ma_.size == 0:
         return mb_
-    if mb_ is nomask:
+    if mb_.size == 0:
         return ma_
     return ma_ | mb_
 
@@ -993,6 +1012,15 @@ def filled(a, fill_value=None):
     if _is_ma(a):
         return a.filled(fill_value)
     return a
+
+
+def is_masked(x):
+    """x 是否含 masked 元素（ma.is_masked 兼容）。"""
+    if not isinstance(x, MaskedArray):
+        return False
+    if x._mask is False or x._mask is None:
+        return False
+    return bool(np.asarray(x._mask, dtype='bool').any())
 
 
 def clip(a, a_min, a_max):

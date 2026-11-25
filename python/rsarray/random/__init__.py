@@ -1832,8 +1832,10 @@ class _WrappedGenerator:
     def integers(self, *args, **kwargs):
         dtype = kwargs.pop('dtype', None)
         result = self._convert(self._inner.integers(*args, **kwargs))
-        if dtype is not None and hasattr(result, 'astype'):
-            result = result.astype(dtype)
+        if dtype is not None:
+            # 强制走 Python 层 astype（值回绕 + dtype 标签），core 版
+            # astype 只重标注会导致窄 dtype 的 tolist 退化为 float
+            result = np.asarray(result).astype(dtype)
         return result
 
     def multinomial(self, n, pvals, size=None):
