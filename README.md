@@ -20,6 +20,7 @@ rsarray 提供完整的高维数组 API，**所有计算密集型逻辑（数组
 - 📊 **完整的高维数组 API** — 涵盖数组、数学、统计、linalg、FFT、random、I/O、polynomial、datetime64、masked/structured array、stride_tricks 等子模块
 - 🪟 **零拷贝缓冲协议** — 实现 PEP 3118（Rust 层 `__getbuffer__`）与 PEP 688（Python 3.12+ `__buffer__`），可被 matplotlib / rsplotlib 等第三方库直接零拷贝消费
 - 🎯 **智能 dtype 推断** — 自动将字符串推断为 `U{n}`，避免不必要的 `object` dtype 性能陷阱
+- 🧪 **masked array 兼容** — 掩码感知聚合（sum/mean/prod/median/percentile）、字段级 mrecords、`ma.clip`/`anom`/`concatenate` 等按 numpy ma 语义对齐
 - 🛠️ **大数组处理工具** — `chunked_apply` 分块接口、`mmap_array` 内存映射、`LazyArray` 惰性求值
 - 💎 **变长元素支持** — `VarStringArray` 变长字符串、`BigIntArray` 任意精度整数
 - 🔒 **线程安全工具** — `threadsafe_copy` / `threadsafe_view`，多线程共享安全且比加锁快 **100x**
@@ -100,6 +101,23 @@ print(rng.random(5).tolist())
 | 1024×1024 | 4.38 ms |
 
 > 小数组（n < 数万）受跨语言调用与线程调度影响，rsarray 可能略慢；规模增大后 Rust 层并行与向量化优势显现。
+
+**大数据级核心化收官（n = 10,000,000，float64；第 16–39 轮优化）**
+
+| 操作 | 耗时 | 说明 |
+|------|------|------|
+| `sum` | 1.1 ms | 归约单遍 |
+| `sort` | 21.0 ms | Rust 排序本体 |
+| `median` | 35.6 ms | O(n) quickselect（免全排序） |
+| `nanmax` / `nanmin` | 27.7 ms | 无分支忽略 NaN 快速路径 |
+| `unique` | 88.1 ms | 内核直连（免 Python 展平） |
+| `cumsum` | 23.7 ms | 原地前缀扫描 |
+| `astype` | 2.8 ms | 数值转换内核（NaN→0/补码回绕） |
+| `bincount` 全链 | 5.0 ms | 含 astype 转换 |
+| `np.polyfit` deg2（100K） | 12.5 ms | 正规方程快路径（Cholesky） |
+| `np.corrcoef` / `np.cov`（1000×100） | 13.8 ms | 对称矩阵优化 |
+| `np.where`（标量分支） | 6.0 ms | 标量按条件形状广播 |
+| `np.percentile` / `np.median`（1M） | 2.5 / 2.8 ms | linear 虚指数插值内核 |
 
 ### 性能架构
 

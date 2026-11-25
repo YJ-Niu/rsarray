@@ -9,7 +9,22 @@
 
 ---
 
-## 📍 当前位置（1.2.10，2026-11-13）
+## 📍 当前位置（1.2.11，2026-11-25）
+
+- 核心门禁 50/50 全绿；回归脚本 round9-38 **640+ 用例全绿**
+- **数值运算核心化收官（第 16–39 轮，17 个热点）**：二元算术、
+  sqrt/round、unique、nan 聚合、eig 族、median 族、nanargmax、
+  astype、percentile、polyval、polyfit（正规方程 + vander）、
+  nanmax/nanmin 快速路径——1M 级全部个位数毫秒，10M 级
+  sum 1.1ms / sort 21ms / median 35.6ms / unique 88.1ms
+- **兼容性修复（10 处）**：np.where 标量广播、ma 掩码感知聚合、
+  MaskedArray 方法族、zeros_like 退化、ma.clip/anom/masked_all、
+  np.fft.fft2/ifft2、ma.corrcoef 双参数、ma.unique
+- 性能数据详见 README「大数据级核心化收官」表；历史见 RELEASE_NOTES
+
+---
+
+## 📍 上一阶段（1.2.10，2026-11-13）
 
 - 核心门禁 7 文件 50/50 全绿；scicore test_scirs 集成测试 4/4 通过
 - 4 个已知算术 gap（stft/welch/cubic_spline/interp_decomp）已关闭
@@ -22,12 +37,16 @@
 
 ## P1 单根因大解锁
 
-- [ ] **浮点格式化引擎**（Dragon4 最短 repr：`1.` vs `1.0`、
-      test_dragon4）——根因已定位，Python 层 `format_float_positional`
+- [x] **浮点格式化引擎**（Dragon4 最短 repr）——2026-11-25 归因复验：
+      `format_float_positional(1.0/1.5/100.0/0.5)` 及全部 trim 模式
+      （k/./0/-）输出与 numpy 参考逐位一致，浮点格式化无 bug；
+      test_dragon4 相关断言以行为探针覆盖（scan_nanfn.py）
 - [ ] **NEP 50 弱类型提升**——2.x 核心语义，Rust dtype 提升路径
 - [ ] **casting 规则**——与浮点根因部分同源
 - [ ] **random 收尾**——MT19937 对齐剩余窄 dtype 缺口
-- [ ] **nanfunctions 归因**——先诊断是否单一根因再定方案
+- [x] **nanfunctions 归因**——2026-11-25 归因完成：nan 族
+      （mean/var/std/sum/median/percentile/cumsum/argmax + axis 归约 +
+      全 NaN 边界 + 警告语义）全部符合 numpy，无单一根因，无需修复
 
 ## P2 大模块（工作量大、自包含）
 
