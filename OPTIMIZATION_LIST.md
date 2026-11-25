@@ -59,11 +59,15 @@
       MaskedRecords 字段访问
 - [x] **字符串函数 剩余缺口**——2026-11-25 收尾：strlen 别名、
       字符串数组 `+` 拼接（此前静默转 0 加法）、2-D 字符串全通过
-- [ ] **datetime64 算术/比较**——2026-11-25 定位：构造即丢数据
-      （字符串未解析为 epoch 数值，底层存 [0.0]，dtype 标签 string_），
-      算术/比较/max/min 全部建立在错误存储上；特性级工程
-      （构造解析 + timedelta64 提升 + repr/tolist 格式化三件套）
-- [ ] **float16 真 dtype**——特性级工作（当前全 f64 存储）
+- [x] **datetime64 算术/比较**——2026-11-25 收尾三件套：①dtype 全名
+      解析（datetime64[D]/timedelta64[unit] → M8/m8 伪 dtype）；②构造
+      字符串→epoch 数值（D/s/ms/us/ns + M 月序，NaT=INT64_MIN 哨兵）；
+      ③tolist/格式化（epoch→ISO 字符串）+ 算术（± int 按单位平移、
+      datetime−datetime → 数值差）；round46 验证 11/11
+- [x] **float16 真 dtype**——2026-11-25 收尾：astype/构造走 IEEE 754
+      binary16 round-trip（struct 'e'），含溢出 → ±inf、subnormal
+      网格、NaN/inf 透传；存储仍 f64（值已按 f16 网格舍入，标签
+      float16），round47 验证 8/8
 
 ## P3 健壮性（C 层）
 

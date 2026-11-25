@@ -301,9 +301,14 @@ class NdArrayMethods:
                         return o
 
                     def _rnd(v):
-                        if isinstance(v, float) and v == v and abs(v) < lim:
+                        if isinstance(v, float) and v == v:
                             try:
-                                return _struct.unpack(fmt, _struct.pack(fmt, v))[0]
+                                return _struct.unpack(
+                                    fmt, _struct.pack(fmt, v))[0]
+                            except OverflowError:
+                                # 溢出目标精度 → ±inf（IEEE 754 语义）
+                                return float('inf') if v > 0 \
+                                    else float('-inf')
                             except Exception:
                                 return v
                         return v

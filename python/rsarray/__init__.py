@@ -900,6 +900,12 @@ class ndarray:
         raw_list = self._array.tolist()
         if dt == 'int64':
             return _convert_nested(raw_list, int)
+        if isinstance(dt, str) and dt.startswith('M8'):
+            # datetime64：epoch 数值 → ISO 字符串
+            return _convert_nested(raw_list, lambda v: _fmt_datetime(v, dt))
+        if isinstance(dt, str) and dt.startswith('m8'):
+            # timedelta64（generic）：int 数值
+            return _convert_nested(raw_list, int)
         if dt in ('int8', 'int16', 'int32'):
             # 底层为 f64 存储的窄有符号 int：tolist 按 numpy 语义返回 int
             return _convert_nested(raw_list, int)
@@ -1966,6 +1972,16 @@ class ndarray:
         if getattr(self, '_rec_parent', None) is not None:
             _propagate_field_writeback(self)
 
+    def _m8_shift(self, other, sign):
+        """datetime64 ± 数值：按 dtype 单位平移（M8 结果，掩码透传）。"""
+        other_arr = other if _is_ndarray(other) else ndarray(other)
+        unit = (self._dtype[3:-1] if '[' in self._dtype else 'D')
+        mult = {'D': 1, 's': 1, 'ms': 1, 'us': 1, 'ns': 1, 'M': 1}.get(unit, 1)
+        out = ndarray._wrap(
+            self._array + sign * other_arr._array * mult, 'int64')
+        out._dtype = self._dtype
+        return out
+
     def __add__(self, other):
         # 字符串数组的 +：numpy 语义为逐元素拼接（np.char.add），而非
         # 字符串→0 的算术加法
@@ -1973,6 +1989,10 @@ class ndarray:
                 or str(getattr(other, '_dtype', '')).startswith(
                     ('string', '<U', 'S')):
             return _char_module.add(self, other)
+        # datetime64 ± 数值：按 dtype 单位平移（M8 + n → M8）
+        _sd = str(getattr(self, '_dtype', ''))
+        if _sd.startswith('M8'):
+            return self._m8_shift(other, 1)
         dt = _promote_dtype(self._dtype, other)
         if self.size == 0:
             return self.copy()
@@ -2001,6 +2021,12 @@ class ndarray:
         return res
 
     def __sub__(self, other):
+        # datetime64：- datetime → timedelta（int 数值）；- 数值 → 平移
+        _sd = str(getattr(self, '_dtype', ''))
+        if _sd.startswith('M8'):
+            if str(getattr(other, '_dtype', '')).startswith('M8'):
+                return ndarray._wrap(self._array - other._array, 'int64')
+            return self._m8_shift(other, -1)
         dt = _promote_dtype(self._dtype, other)
         if self.size == 0:
             return self.copy()
@@ -7572,6 +7598,11 @@ def array(data, dtype=None, copy=True, order='K', subok=False, ndmin=0):
     _m8s = _m8_label_of(dtype)
     if _m8s is not None:
         _src = data.tolist() if _is_ndarray(data) else data
+        if _m8s[0] == 'M':
+            # 字符串日期 → epoch 数值（字符串直接转 int64 会失败为 0）
+            _src = _parse_datetime_strings(_src, _m8s)
+        else:
+            _src = _parse_timedelta_strings(_src, _m8s)
         _arr = array(_src, dtype='int64', copy=copy, order=order,
                      subok=subok, ndmin=ndmin)
         _arr._dtype = _m8s
@@ -9517,12 +9548,86 @@ def identity(n, dtype=None):
     return eye(n, dtype=dtype)
 
 
+def _fmt_datetime(v, label):
+    """epoch 数值 → ISO 字符串（datetime64 tolist/repr 格式化）。"""
+    if v == -(1 << 63):
+        return 'NaT'
+    unit = label[3:-1] if '[' in label else 'D'
+    if unit in ('D', 'generic'):
+        return str(_datetime.date(1970, 1, 1)
+                   + _datetime.timedelta(days=int(v)))
+    if unit == 'M':
+        y, m = divmod(int(v), 12)
+        return '%04d-%02d' % (1970 + y, m + 1)
+    mult = {'s': 1, 'ms': 10 ** 3, 'us': 10 ** 6, 'ns': 10 ** 9}
+    secs = int(v) / mult.get(unit, 1)
+    base = _datetime.datetime(1970, 1, 1) + _datetime.timedelta(seconds=secs)
+    return base.isoformat()
+
+
+def _parse_datetime_strings(src, label):
+    """datetime64 字符串 → epoch 数值（递归嵌套；int 视为已是 epoch）。
+
+    单位换算：D=天、s/ms/us/ns=秒级倍数、M=月序；NaT/None = INT64_MIN。
+    """
+    unit = label[3:-1] if '[' in label else 'D'
+    _epoch = _datetime.date(1970, 1, 1)
+    _mult = {'s': 1, 'ms': 10 ** 3, 'us': 10 ** 6, 'ns': 10 ** 9}
+
+    def _conv(v):
+        if v is None:
+            return -(1 << 63)
+        if isinstance(v, (int, float)):
+            return int(v)
+        s = str(v).strip()
+        if 'T' in s or ' ' in s:
+            dt_ = _datetime.datetime.fromisoformat(s.replace(' ', 'T'))
+            secs = dt_.replace(tzinfo=_datetime.timezone.utc).timestamp()
+            if unit == 'D':
+                return int(secs // 86400)
+            return int(secs * _mult.get(unit, 1))
+        d_ = _datetime.date.fromisoformat(s[:10])
+        days = (d_ - _epoch).days
+        if unit in ('D', 'generic', 'M'):
+            return days
+        return days * 86400 * _mult.get(unit, 1)
+
+    def _walk(x):
+        if isinstance(x, list):
+            return [_walk(i) for i in x]
+        return _conv(x)
+
+    return _walk(src)
+
+
+def _parse_timedelta_strings(src, label):
+    """timedelta64 字符串/数值 → int64（generic 语义：按单位整数值）。"""
+    def _conv(v):
+        if v is None:
+            return -(1 << 63)
+        if isinstance(v, (int, float)):
+            return int(v)
+        return int(str(v).strip())
+
+    def _walk(x):
+        if isinstance(x, list):
+            return [_walk(i) for i in x]
+        return _conv(x)
+
+    return _walk(src)
+
+
 def _m8_label_of(dtype):
     """m8[X]/M8[X] dtype 请求 → 规范化标签字符串；其他返回 None。"""
     if dtype is None:
         return None
     s = dtype if isinstance(dtype, str) else str(dtype)
     t = s.lstrip('<>=|')
+    # 全名形式：datetime64[X] / timedelta64[X]（numpy 兼容写法）
+    if t.startswith('datetime64'):
+        t = 'M8' + t[len('datetime64'):]
+    elif t.startswith('timedelta64'):
+        t = 'm8' + t[len('timedelta64'):]
     if (len(t) > 4 and t[1] == '8' and t[2] == '[' and t[-1] == ']'
             and t[0] in 'Mm' and t[3:-1].isalpha()):
         return t

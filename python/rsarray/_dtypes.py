@@ -818,6 +818,14 @@ def _parse_scalar_token(s):
     if (len(s) > 4 and s[1] == '8' and s[2] == '[' and s[-1] == ']'
             and s[0] in 'Mm' and s[3:-1].isalpha()):
         return _make_datetime(s[0], s[3:-1], bo)
+    # 全名形式：datetime64[unit] / timedelta64[unit]（numpy 兼容；
+    # 无单位 'datetime64' = generic）
+    for _dn, _dk in (('datetime64', 'M'), ('timedelta64', 'm')):
+        if s == _dn:
+            return _make_datetime(_dk, 'generic', bo)
+        if s.startswith(_dn + '[') and s.endswith(']') \
+                and s[len(_dn) + 1:-1].isalpha():
+            return _make_datetime(_dk, s[len(_dn) + 1:-1], bo)
     low = s.lower()
     if s in _KINDSIZE:
         return _make_scalar(_KINDSIZE[s], bo)
