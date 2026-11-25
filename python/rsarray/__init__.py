@@ -1967,6 +1967,12 @@ class ndarray:
             _propagate_field_writeback(self)
 
     def __add__(self, other):
+        # 字符串数组的 +：numpy 语义为逐元素拼接（np.char.add），而非
+        # 字符串→0 的算术加法
+        if str(getattr(self, '_dtype', '')).startswith(('string', '<U', 'S')) \
+                or str(getattr(other, '_dtype', '')).startswith(
+                    ('string', '<U', 'S')):
+            return _char_module.add(self, other)
         dt = _promote_dtype(self._dtype, other)
         if self.size == 0:
             return self.copy()

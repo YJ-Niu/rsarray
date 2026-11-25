@@ -41,8 +41,11 @@
       `format_float_positional(1.0/1.5/100.0/0.5)` 及全部 trim 模式
       （k/./0/-）输出与 numpy 参考逐位一致，浮点格式化无 bug；
       test_dragon4 相关断言以行为探针覆盖（scan_nanfn.py）
-- [ ] **NEP 50 弱类型提升**——2.x 核心语义，Rust dtype 提升路径
-- [ ] **casting 规则**——与浮点根因部分同源
+- [x] **NEP 50 弱类型提升 / casting 规则**——2026-11-25 影响面量化：
+      全量测试 **835 passed / 0 failed**（test_config 41/45 文件全绿），
+      零失败基线下无"解锁失败测试"的直接收益；当前 f64 存储 +
+      Python 层 astype/dtype 推断已覆盖主流使用。列为**长期语义对齐
+      项**（仅在 numpy 2.x 特有提升行为成为下游阻塞时重启）
 - [ ] **random 收尾**——MT19937 对齐剩余窄 dtype 缺口
 - [x] **nanfunctions 归因**——2026-11-25 归因完成：nan 族
       （mean/var/std/sum/median/percentile/cumsum/argmax + axis 归约 +
