@@ -53,8 +53,16 @@
 
 ## P2 大模块（工作量大、自包含）
 
-- [ ] **masked arrays** 剩余语义簇——最大单簇，专项推进
-- [ ] **字符串函数** 剩余缺口——char_op.rs 近期刚起步
+- [x] **masked arrays 剩余语义簇**——2026-11-25 收尾：sort（掩码同步
+      重排）/cumsum/is_masked/count_masked/average 权重路径
+      （mask_or nomask 短路 + returned s）/concatenate 掩码包装/
+      MaskedRecords 字段访问
+- [x] **字符串函数 剩余缺口**——2026-11-25 收尾：strlen 别名、
+      字符串数组 `+` 拼接（此前静默转 0 加法）、2-D 字符串全通过
+- [ ] **datetime64 算术/比较**——2026-11-25 定位：构造即丢数据
+      （字符串未解析为 epoch 数值，底层存 [0.0]，dtype 标签 string_），
+      算术/比较/max/min 全部建立在错误存储上；特性级工程
+      （构造解析 + timedelta64 提升 + repr/tolist 格式化三件套）
 - [ ] **float16 真 dtype**——特性级工作（当前全 f64 存储）
 
 ## P3 健壮性（C 层）

@@ -974,9 +974,10 @@ def mask_or(a, b):
     """两个掩码按位或（ma.mask_or 兼容）。"""
     ma_ = getmaskarray(a)
     mb_ = getmaskarray(b)
-    if ma_ is nomask:
+    # nomask（False）经 getmaskarray 退化为空数组——按空掩码短路
+    if ma_.size == 0:
         return mb_
-    if mb_ is nomask:
+    if mb_.size == 0:
         return ma_
     return ma_ | mb_
 

@@ -77,7 +77,8 @@ del _n
 # ma 顶层亦暴露 extras 的常用名
 for _n in ('atleast_1d', 'atleast_2d', 'atleast_3d', 'average', 'clump',
            'clump_masked', 'clump_unmasked', 'compress_nd', 'compress_rowcols',
-           'corrcoef', 'cov', 'diagflat', 'ediff1d', 'flatnotmasked_contiguous',
+           'corrcoef', 'count_masked', 'cov', 'diagflat', 'ediff1d',
+           'flatnotmasked_contiguous',
            'in1d', 'intersect1d', 'isin', 'masked_all', 'masked_all_like',
            'mask_rowcols', 'mask_rows', 'mask_cols', 'median', 'mr_', 'ndenumerate', 'notmasked_contiguous',
            'notmasked_edges', 'polyfit', 'setdiff1d', 'setxor1d', 'stack',

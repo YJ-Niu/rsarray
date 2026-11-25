@@ -166,6 +166,10 @@ def average(a, axis=None, weights=None, returned=False, **kwargs):
         else:
             w = (~m).astype(float)
             res = (data * w).sum(axis=axis) / w.sum(axis=axis)
+        # returned=True 语义：s = 有效元素计数
+        s = res if axis is not None else np.asarray(
+            float(np.asarray(~m, dtype='int64').sum())
+            if m is not nomask else float(data.size))
     else:
         w = np.asarray(weights, dtype=float)
         if isMaskedArray(weights):
@@ -524,6 +528,11 @@ def unique(ar, return_index=False, return_inverse=False, return_counts=False,
     if return_counts:
         ret.append(np.array(counts))
     return ret[0] if len(ret) == 1 else tuple(ret)
+
+
+def count_masked(a):
+    """返回 a 中 masked 元素个数（ma.count_masked 兼容）。"""
+    return int(np.asarray(getmaskarray(a), dtype='bool').sum())
 
 
 def median(a, axis=None, overwrite_input=False, keepdims=False, **kwargs):
